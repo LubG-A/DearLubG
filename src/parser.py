@@ -25,6 +25,7 @@ class ParsedResult:
     react_target_msg_index: int = 0
     delay_seconds: int = 0
     affinity_delta: dict = field(default_factory=dict)
+    reply_delay_minutes: int = 0  # 延迟回复：N 分钟后再回这批消息
 
 
 def parse_and_validate(raw_content: str) -> ParsedResult:
@@ -91,6 +92,21 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
         if msg_type not in VALID_MSG_TYPES:
             logger.warning(f"未知消息段 type={msg_type}，丢弃")
             continue
+        # reply 段：校验 target_msg_index（正序 1-based，由 sender 配合 history 校验范围）
+        if msg_type == "reply":
+            data_dict = msg.get("data", {})
+            if not isinstance(data_dict, dict):
+                data_dict = {}
+            idx = data_dict.get("target_msg_index", 0)
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                idx = 0
+            if idx < 1:
+                logger.warning(f"reply 段 target_msg_index={idx} 无效（应≥1），清空 reply 段")
+                continue  # 无效的 reply 段直接丢弃
+            data_dict["target_msg_index"] = idx
+            msg["data"] = data_dict
         cleaned_messages.append(msg)
 
     # affinity_delta 校验
@@ -110,13 +126,34 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
         delay = 0
     delay = min(delay, 15)
 
+    # reply_delay_minutes 校验（延迟回复）
+    # 仅当 action=silent 时有效：表示"已读但稍后回"，不是真的 silent
+    reply_delay = data.get("reply_delay_minutes", 0)
+    if not isinstance(reply_delay, (int, float)) or reply_delay < 0:
+        reply_delay = 0
+    reply_delay = min(int(reply_delay), 120)  # 上限 2 小时，避免过长
+
+    # 语义校验：reply_delay_minutes 仅在 silent 时有意义
+    # 若 action != silent 但有 reply_delay_minutes，忽略（按 reply/react 正常处理）
+    final_reply_delay = reply_delay if action == "silent" else 0
+
+    # react_target_msg_index 校验（正序 1-based，与 user content 编号一致）
+    react_idx = data.get("react_target_msg_index", 1)
+    try:
+        react_idx = int(react_idx)
+    except (TypeError, ValueError):
+        react_idx = 1
+    if react_idx < 1:
+        react_idx = 1
+
     return ParsedResult(
         thought=data.get("thought", ""),
         action=action,
         targets=data.get("targets", []),
         messages=cleaned_messages,
         react_emoji_id=str(data.get("react_emoji_id", "")),
-        react_target_msg_index=int(data.get("react_target_msg_index", 0)),
+        react_target_msg_index=react_idx,
         delay_seconds=int(delay),
         affinity_delta=cleaned_delta,
+        reply_delay_minutes=final_reply_delay,
     )

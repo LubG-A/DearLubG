@@ -33,6 +33,9 @@ class HistoryManager:
         # 待拼入下一个 user 的群消息缓冲（未触发"看一眼"的消息累积于此）
         # 格式：[{"time":"HH:MM","qq":"...","nickname":"...","content":"...","is_bot":bool,"msg_id":"..."}]
         self.pending_group_msgs: list[dict] = []
+        # 延迟回复缓冲：LLM 觉得"等会再回"时，把这批 pending 消息存到这里
+        # 格式：[{"due_time":"ISO时间戳", "messages":[{同 pending 格式}]}]
+        self.delayed_replies: list[dict] = []
         self._load()
 
     # ---------- 持久化 ----------
@@ -43,6 +46,7 @@ class HistoryManager:
                 self.messages = data.get("messages", [])
                 self.summary = data.get("summary", "")
                 self.pending_group_msgs = data.get("pending_group_msgs", [])
+                self.delayed_replies = data.get("delayed_replies", [])
             except Exception as e:
                 logger.warning(f"加载历史失败: {e}")
 
@@ -52,6 +56,7 @@ class HistoryManager:
                 "messages": self.messages,
                 "summary": self.summary,
                 "pending_group_msgs": self.pending_group_msgs,
+                "delayed_replies": self.delayed_replies,
             }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -158,18 +163,26 @@ class HistoryManager:
     def build_user_content(self) -> str:
         """把 pending buffer 拼成 user content，并清空 buffer。
 
-        格式：
-        # 最近群消息（按时间顺序，每行一条）
-        [20:03:37] 张三(123456789): 你好啊
-        [20:03:43] 张三(123456789): 你好              [连发中]
+        格式（正序 1-based 编号，用于 reply 段的 target_msg_index）：
+        # 最近群消息（按时间顺序，每行一条，编号可用于 reply 段引用）
+        [1] [20:03:37] 张三(123456789): 你好啊
+        [2] [20:03:43] 张三(123456789): 你好              [连发中]
+        [3] [20:04:00] [bot] 林夏(...): 嗯                # bot 消息不可引用
+        [4] [20:04:05] 张三(123456789): 之前那条          [延迟回复]
         """
         burst_indices = self.mark_burst_messages()
         lines = []
         for i, m in enumerate(self.pending_group_msgs):
+            seq = i + 1  # 正序 1-based
             prefix = "[bot]" if m["is_bot"] else ""
-            burst_tag = "  [连发中]" if i in burst_indices else ""
+            tags = []
+            if i in burst_indices:
+                tags.append("[连发中]")
+            if m.get("is_delayed"):
+                tags.append("[延迟回复]")
+            tag_str = ("  " + " ".join(tags)) if tags else ""
             lines.append(
-                f"[{m['time']}] {prefix}{m['nickname']}({m['qq']}): {m['content']}{burst_tag}"
+                f"[{seq}] [{m['time']}] {prefix}{m['nickname']}({m['qq']}): {m['content']}{tag_str}"
             )
         return "\n".join(lines)
 
@@ -227,18 +240,18 @@ class HistoryManager:
         return self.messages.copy()
 
     def get_msg_id_by_index(self, index: int) -> Optional[str]:
-        """从最近一轮 user 内容对应的群消息里取 msg_id（用于 reply 段）。
+        """按 user content 中的正序编号取 msg_id（用于 reply 段）。
 
-        index 含义：0=最近一条群消息，1=倒数第二条...
-        从 pending_group_msgs 倒序找非 bot 消息。
+        index 含义：1=第一条群消息，2=第二条...（与 user content 显示的 [N] 编号一致）
+        bot 消息不可引用（返回 None）。
+        越界或无效返回 None，sender 会跳过 reply 段。
         """
-        count = 0
-        for m in reversed(self.pending_group_msgs):
-            if not m["is_bot"]:
-                if count == index:
-                    return m.get("msg_id", "")
-                count += 1
-        return None
+        if index < 1 or index > len(self.pending_group_msgs):
+            return None
+        m = self.pending_group_msgs[index - 1]
+        if m["is_bot"]:
+            return None  # 不允许引用 bot 自己的消息
+        return m.get("msg_id", "") or None
 
     def recent_message_count(self, seconds: int = 180) -> int:
         """最近 N 秒内群消息数量（用于话题热度评分）。
@@ -270,3 +283,80 @@ class HistoryManager:
     def get_summary(self) -> str:
         """返回早期对话摘要（拼到 system 末尾用）。"""
         return self.summary
+
+    # ---------- 延迟回复管理 ----------
+    def stash_pending_as_delayed(self, delay_minutes: int) -> int:
+        """把当前 pending 消息存到 delayed_replies，N 分钟后到期。
+
+        用于 LLM 输出 reply_delay_minutes 时：当前这批消息暂不回，
+        等 N 分钟后由下次触发重新带入 pending。
+
+        Args:
+            delay_minutes: 延迟分钟数（LLM 输出）
+
+        Returns:
+            存入的消息条数
+        """
+        if not self.pending_group_msgs:
+            return 0
+        from datetime import timedelta
+        due = datetime.now() + timedelta(minutes=delay_minutes)
+        self.delayed_replies.append({
+            "due_time": due.isoformat(),
+            "messages": list(self.pending_group_msgs),  # 拷贝
+        })
+        count = len(self.pending_group_msgs)
+        logger.info(f"延迟回复：存入 {count} 条消息，{delay_minutes} 分钟后到期（{due.strftime('%H:%M:%S')}）")
+        self._save()
+        return count
+
+    def pop_due_delayed_into_pending(self) -> int:
+        """检查 delayed_replies，把到期/超时的消息重新加入 pending。
+
+        在每次 LLM 调用前调用。到期的延迟消息会以 [延迟回复] 标注加入 pending，
+        触发 LLM 的 multi_reply 分片回复。
+
+        Returns:
+            重新加入 pending 的消息条数
+        """
+        if not self.delayed_replies:
+            return 0
+
+        now = datetime.now()
+        due_items = []
+        remaining = []
+        for item in self.delayed_replies:
+            try:
+                due_time = datetime.fromisoformat(item["due_time"])
+                if due_time <= now:
+                    due_items.append(item)
+                else:
+                    remaining.append(item)
+            except (ValueError, KeyError):
+                # 解析失败的也视为到期（避免永久卡住）
+                due_items.append(item)
+
+        if not due_items:
+            return 0
+
+        # 把到期消息加入 pending，标注 is_delayed=True
+        added = 0
+        for item in due_items:
+            for m in item["messages"]:
+                # 标注为延迟回复（render 时会显示 [延迟回复]）
+                m_copy = dict(m)
+                m_copy["is_delayed"] = True
+                # 更新时间为当前时间（让连发检测等逻辑正常工作）
+                m_copy["time"] = now.strftime("%H:%M:%S")
+                self.pending_group_msgs.append(m_copy)
+                added += 1
+
+        self.delayed_replies = remaining
+        if added > 0:
+            logger.info(f"延迟回复到期：{added} 条消息重新加入 pending")
+            self._save()
+        return added
+
+    def has_delayed_replies(self) -> bool:
+        """是否有未到期的延迟回复。"""
+        return len(self.delayed_replies) > 0

@@ -1,7 +1,9 @@
 """QQ 群聊机器人主入口。
 
 流程：
-群聊消息 -> 入 silent_buffer -> 检查摘要压缩 -> 评分门槛 -> LLM 调用 -> 结果处理
+- 被动触发：群聊消息 -> 入 silent_buffer -> 评分门槛 -> LLM 调用 -> 结果处理
+- 主动触发：定时器唤醒 -> LLM 调用（无新消息，让 LLM 自主决定要不要主动开口）
+- 延迟回复：LLM 输出 reply_delay_minutes -> 消息暂存 -> 下次触发时重新加入 pending
 """
 import time
 import random
@@ -17,6 +19,7 @@ from src.attribution import AttributionManager
 from src.affinity import AffinityManager
 from src.persona import PersonaRenderer
 from src.parser import parse_and_validate
+from src.scheduler import ActiveScheduler
 from src.senders.message_sender import NapCatMessageSender
 from src.senders.voice_sender import AIRecordVoiceSender, LocalFileVoiceSender
 from src.senders.image_sender import EmptyImageSender
@@ -39,6 +42,7 @@ class Bot:
         self.attribution = AttributionManager(self.config)
         self.affinity = AffinityManager()
         self.persona_renderer = PersonaRenderer(self.config)
+        self.scheduler = ActiveScheduler(self.config)
 
         # Sender 实现
         self.message_sender = NapCatMessageSender(self.napcat)
@@ -54,7 +58,7 @@ class Bot:
         self.self_nickname: str = ""
         self.trigger_evaluator: Optional[TriggerEvaluator] = None
         self.last_reply_time: float = 0
-        # 消息处理锁：保证 on_group_message 串行，避免并发 LLM 调用
+        # 消息处理锁：保证 on_group_message 和主动触发串行，避免并发 LLM 调用
         self._msg_lock = threading.Lock()
 
     def warmup(self):
@@ -97,14 +101,37 @@ class Bot:
                 if not self.trigger_evaluator.should_peek(score):
                     return  # 未达阈值，等下一条
 
-                # 3. 调用 LLM
-                self._invoke_llm(soft_factors)
+                # 3. 调用 LLM（被动触发）
+                self._invoke_llm(soft_factors, is_active=False)
 
             except Exception as e:
                 logger.error(f"处理消息异常: {e}", exc_info=True)
 
-    def _invoke_llm(self, soft_factors):
-        """调用 LLM 并处理结果。使用多轮对话格式。"""
+    def on_active_trigger(self):
+        """主动触发回调（由调度器调用）。
+
+        获取锁后调用 LLM，标记 is_active=True 让 LLM 知道这是主动检查。
+        """
+        with self._msg_lock:
+            try:
+                logger.info("主动触发：执行 LLM 调用")
+                # 主动触发时不传 soft_factors（无群消息触发，无评分）
+                self._invoke_llm(soft_factors=None, is_active=True)
+            except Exception as e:
+                logger.error(f"主动触发异常: {e}", exc_info=True)
+
+    def _invoke_llm(self, soft_factors, is_active: bool = False):
+        """调用 LLM 并处理结果。使用多轮对话格式。
+
+        Args:
+            soft_factors: 触发评分软因子（主动触发时为 None）
+            is_active: 是否为主动触发（影响 user content 渲染）
+        """
+        # 调用前：检查延迟回复是否到期，把到期消息加入 pending
+        due_count = self.history.pop_due_delayed_into_pending()
+        if due_count > 0:
+            logger.info(f"延迟回复到期，{due_count} 条消息已加入 pending")
+
         # 构建 system prompt（含早期摘要）
         summary = self.history.get_summary()
         system_prompt = self.persona_renderer.render_system_prompt(summary)
@@ -116,7 +143,8 @@ class Bot:
         member_list = self._build_member_list()
         pending_text = self.history.build_user_content()
         new_user_content = self.persona_renderer.render_user_content(
-            pending_text, member_list, self.self_nickname, self.self_qq
+            pending_text, member_list, self.self_nickname, self.self_qq,
+            is_active=is_active,
         )
 
         # 调用 LLM（传入完整历史 + 本轮新 user）
@@ -127,22 +155,33 @@ class Bot:
             # 这里选择不落地，pending 留待下次触发再拼入（消息不丢失）
             return
 
+        # 解析校验（在 consume 之前解析，以便根据 reply_delay 决定是否存到 delayed_replies）
+        parsed = parse_and_validate(raw_result)
+
+        logger.info(f"LLM 返回 action={parsed.action} thought={parsed.thought[:50]}"
+                    f"{' reply_delay=' + str(parsed.reply_delay_minutes) + 'min' if parsed.reply_delay_minutes > 0 else ''}"
+                    f"{' [主动触发]' if is_active else ''}")
+
+        # 延迟回复处理：LLM 觉得"等会再回"，把这批消息存到 delayed_replies
+        # 注意：主动触发时 pending 可能为空，stash_pending_as_delayed 内部会检查
+        if parsed.reply_delay_minutes > 0 and parsed.action == "silent":
+            self.history.stash_pending_as_delayed(parsed.reply_delay_minutes)
+
         # 落地本轮 user/assistant 对话到历史
         # consume pending（清空 buffer，内容已进入 messages）
         consumed_user_content = self.history.consume_pending_into_user()
         # 用渲染后的 user content 落地（包含群成员上下文）
         self.history.append_turn(new_user_content, raw_result)
 
-        # 解析校验
-        parsed = parse_and_validate(raw_result)
-
-        logger.info(f"LLM 返回 action={parsed.action} thought={parsed.thought[:50]}")
-
-        # 4. 结果处理
+        # 4. 结果处理（主动触发时 soft_factors 为 None，归因跳过）
         self._handle_result(parsed, soft_factors)
 
     def _handle_result(self, parsed, soft_factors):
-        """处理 LLM 结果：执行动作 -> 写回历史 -> 亲密度 -> 归因。"""
+        """处理 LLM 结果：执行动作 -> 写回历史 -> 亲密度 -> 归因。
+
+        Args:
+            soft_factors: 触发评分软因子（主动触发时为 None，归因跳过）
+        """
         # 延迟：delay_seconds 叠加 0.3-1.2 秒/字的随机抖动（模拟"打字中"）
         if parsed.delay_seconds > 0 or parsed.messages:
             total_text_len = sum(len(_msg_to_text(m)) for m in parsed.messages)
@@ -153,8 +192,9 @@ class Bot:
                 time.sleep(total_delay)
 
         if parsed.action == "silent":
-            # 不发送，但仍更新归因
-            self.attribution.update(soft_factors, "silent")
+            # 不发送，但仍更新归因（主动触发时 soft_factors=None，跳过）
+            if soft_factors is not None:
+                self.attribution.update(soft_factors, "silent")
             self.affinity.apply_delta(parsed.affinity_delta)
             return
 
@@ -162,7 +202,8 @@ class Bot:
             # 预留接口
             msg_id = self.history.get_msg_id_by_index(parsed.react_target_msg_index)
             self.emoji_reactor.react(self.config.napcat.group_id, msg_id, parsed.react_emoji_id)
-            self.attribution.update(soft_factors, "react")
+            if soft_factors is not None:
+                self.attribution.update(soft_factors, "react")
             self.affinity.apply_delta(parsed.affinity_delta)
             return
 
@@ -177,8 +218,9 @@ class Bot:
         # 亲密度更新
         self.affinity.apply_delta(parsed.affinity_delta)
 
-        # 归因更新
-        self.attribution.update(soft_factors, parsed.action)
+        # 归因更新（主动触发时 soft_factors=None，跳过）
+        if soft_factors is not None:
+            self.attribution.update(soft_factors, parsed.action)
 
     def _send_messages(self, messages: list):
         """发送消息列表，带间隔。"""
@@ -239,6 +281,15 @@ class Bot:
             webhook_host, webhook_port, self.on_group_message,
             target_group_id=self.config.napcat.group_id,
         )
+        # 启动主动触发调度器
+        if self.config.active_trigger and self.config.active_trigger.enabled:
+            self.scheduler.start(self.on_active_trigger)
+            logger.info(f"主动触发调度器已启动：{self.config.active_trigger.min_interval_minutes}-"
+                        f"{self.config.active_trigger.max_interval_minutes} 分钟随机，"
+                        f"深夜 {self.config.active_trigger.night_start_hour}:00-"
+                        f"{self.config.active_trigger.night_end_hour}:00 禁用")
+        else:
+            logger.info("主动触发调度器已禁用")
         logger.info(f"机器人启动（仅监听群 {self.config.napcat.group_id}）")
         server.start()
 
