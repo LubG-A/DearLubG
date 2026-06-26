@@ -35,8 +35,8 @@ from src.utils.logger import get_logger
 logger = get_logger("main")
 
 # 冷却配置
-HARD_COOLDOWN_SECONDS = 1       # 硬因子（@/提问）触发冷却，距上次回复 <2s 推迟
-SOFT_COOLDOWN_MIN = 5         # 软因子触发冷却下限
+HARD_COOLDOWN_SECONDS = 5       # 硬因子（@/提问）触发冷却，距上次回复 <2s 推迟
+SOFT_COOLDOWN_MIN = 16         # 软因子触发冷却下限
 SOFT_COOLDOWN_MAX = 60         # 软因子触发冷却上限
 QUIET_WINDOW_SECONDS = 5       # 静默窗口：N 秒无新消息后兜底触发
 
