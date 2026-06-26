@@ -63,6 +63,7 @@ class TriggerEvaluator:
         factors.append(TriggerFactor(
             "interest_keyword", self.config.trigger_factors["interest_keyword"],
             is_hard=False,
+            hit=interest_hit,
         ))
 
         # 软因子：熟人发言（亲密度线性插值）
@@ -91,6 +92,7 @@ class TriggerEvaluator:
         factors.append(TriggerFactor(
             "topic_hot", self.config.trigger_factors["topic_hot"],
             is_hard=False,
+            hit=topic_hot,
         ))
 
         # 硬因子：深夜时段
@@ -122,7 +124,9 @@ class TriggerEvaluator:
             elif f.name == "spam" and spam:
                 total += f.effective_value
 
-        soft_factors = [f for f in factors if not f.is_hard and f.effective_value != 0]
+        # 只把命中（hit=True）的软因子返回给归因系统。
+        # 未命中的因子不应参与归因——它们没有贡献分数，也就没有"触发责任"可归因。
+        soft_factors = [f for f in factors if not f.is_hard and f.hit]
         return total, soft_factors
 
     def should_peek(self, score: float) -> bool:

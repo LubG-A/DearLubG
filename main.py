@@ -122,7 +122,9 @@ class Bot:
             # 3. 触发决策
             if is_hard:
                 self._try_trigger_immediate(hard=True)
-            # 软因子不立即触发，等静默窗口兜底
+            elif self.trigger_evaluator.should_peek(score):
+                self._try_trigger_immediate(hard=False, soft_factors=soft_factors)
+            # 低分消息不立即触发，等静默窗口兜底
 
             # 4. 重置静默定时器（无论硬软，新消息都推迟兜底触发）
             self._reschedule_quiet_trigger()
@@ -138,26 +140,32 @@ class Bot:
             return True
         return False
 
-    def _try_trigger_immediate(self, hard: bool = False):
-        """立即尝试触发 LLM（硬因子路径）。
+    def _try_trigger_immediate(self, hard: bool = False, soft_factors=None):
+        """立即尝试触发 LLM（硬因子或软因子路径）。
 
-        冷却检查：距上次回复 < HARD_COOLDOWN_SECONDS 则跳过（让静默窗口兜底）。
+        冷却检查：距上次回复 < cooldown 则跳过（让静默窗口兜底）。
         非阻塞抢 _llm_lock：抢不到说明已有 LLM 调用在进行，让静默窗口兜底。
+
+        Args:
+            hard: True=硬因子触发（@/提问），False=软因子触发（评分过阈值）
+            soft_factors: 软因子触发时传入命中的软因子列表，供归因使用；
+                         硬因子触发传 None，归因跳过。
         """
         now = time.time()
         elapsed = now - self.last_reply_time
         cooldown = HARD_COOLDOWN_SECONDS if hard else SOFT_COOLDOWN_MIN
+        trigger_label = "硬因子" if hard else "软因子"
         if elapsed < cooldown:
-            logger.debug(f"硬因子触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），等静默窗口兜底")
+            logger.debug(f"{trigger_label}触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），等静默窗口兜底")
             return
 
         # 非阻塞尝试拿 LLM 锁
         if not self._llm_lock.acquire(blocking=False):
-            logger.debug("硬因子触发但 LLM 锁被占用，等静默窗口兜底")
+            logger.debug(f"{trigger_label}触发但 LLM 锁被占用，等静默窗口兜底")
             return
 
         try:
-            self._run_llm_cycle(soft_factors=None, is_active=False)
+            self._run_llm_cycle(soft_factors=soft_factors, is_active=False)
         finally:
             self._llm_lock.release()
 
