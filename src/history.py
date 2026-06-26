@@ -50,6 +50,10 @@ class HistoryManager:
         # 延迟回复缓冲：LLM 觉得"等会再回"时，把这批 pending 消息存到这里
         # 格式：[{"due_time":"ISO时间戳", "messages":[{同 pending 格式}]}]
         self.delayed_replies: list[dict] = []
+        # 渲染快照：build_user_content 时对 pending 做浅拷贝，供后续 get_msg_id_by_index 读取。
+        # 解决"consume_pending_into_user 清空 pending 后，_handle_result 中 reply/react 段取不到 msg_id"的问题。
+        # 快照在 LLM 工作线程内创建和消费，无跨线程访问，无需额外锁。
+        self._rendered_pending_snapshot: list[dict] = []
         self._load()
 
     # ---------- 持久化 ----------
@@ -114,7 +118,10 @@ class HistoryManager:
 
     # ---------- 构建 user content（触发"看一眼"时调用） ----------
     def build_user_content(self) -> str:
-        """把 pending buffer 拼成 user content，并清空 buffer。
+        """把 pending buffer 拼成 user content。
+
+        同时做一份 pending 浅拷贝存到 _rendered_pending_snapshot，
+        供后续 get_msg_id_by_index 读取（consume 清空 pending 后仍可查 msg_id）。
 
         格式（正序 1-based 编号，用于 reply 段的 target_msg_index）：
         # 最近群消息（按时间顺序，每行一条，编号可用于 reply 段引用）
@@ -126,6 +133,8 @@ class HistoryManager:
         注：连发由"批量 drain + 静默窗口"自然体现——LLM 会看到多条同一发送者
         时间戳相邻的消息，无需额外标记。
         """
+        # 快照：LLM 看到的 [N] 编号 ↔ msg_id 映射，供 reply/react 段解析引用
+        self._rendered_pending_snapshot = list(self.pending_group_msgs)
         lines = []
         for i, m in enumerate(self.pending_group_msgs):
             seq = i + 1  # 正序 1-based
@@ -190,15 +199,20 @@ class HistoryManager:
         return self.messages.copy()
 
     def get_msg_id_by_index(self, index: int) -> Optional[str]:
-        """按 user content 中的正序编号取 msg_id（用于 reply 段）。
+        """按 user content 中的正序编号取 msg_id（用于 reply / react 段）。
 
         index 含义：1=第一条群消息，2=第二条...（与 user content 显示的 [N] 编号一致）
         bot 消息不可引用（返回 None）。
         越界或无效返回 None，sender 会跳过 reply 段。
+
+        注意：读 _rendered_pending_snapshot 而非 live pending——
+        本方法在 consume_pending_into_user 之后调用（_handle_result 阶段），
+        此时 pending 已清空，只有快照保留着 LLM 看到的编号→msg_id 映射。
         """
-        if index < 1 or index > len(self.pending_group_msgs):
+        snapshot = self._rendered_pending_snapshot
+        if index < 1 or index > len(snapshot):
             return None
-        m = self.pending_group_msgs[index - 1]
+        m = snapshot[index - 1]
         if m["is_bot"]:
             return None  # 不允许引用 bot 自己的消息
         return m.get("msg_id", "") or None
