@@ -6,8 +6,15 @@
 
 每轮 LLM 调用必有 assistant 落地，silent 也是真实回复。
 超过阈值时对早期 user/assistant 对做摘要压缩，塞进 system 末尾。
+
+并发模型：
+- 接收线程（webhook）调 append_group_message 写 fast_buffer（_buffer_lock 保护）
+- LLM 工作线程调 drain_buffer_to_pending 原子地把 fast_buffer 移到 pending
+- pending 的所有后续读写都在 LLM 线程内，无需额外锁
+- recent_message_count 需同时看 fast_buffer 和 pending，用 _buffer_lock 保护
 """
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -33,6 +40,10 @@ class HistoryManager:
         # 待拼入下一个 user 的群消息缓冲（未触发"看一眼"的消息累积于此）
         # 格式：[{"time":"HH:MM","qq":"...","nickname":"...","content":"...","is_bot":bool,"msg_id":"..."}]
         self.pending_group_msgs: list[dict] = []
+        # fast_buffer：接收线程无锁快速写入，LLM 线程 drain 到 pending
+        # 解决"LLM 调用持锁期间新消息无法 pending"的问题
+        self.fast_buffer: list[dict] = []
+        self._buffer_lock = threading.Lock()
         # 延迟回复缓冲：LLM 觉得"等会再回"时，把这批 pending 消息存到这里
         # 格式：[{"due_time":"ISO时间戳", "messages":[{同 pending 格式}]}]
         self.delayed_replies: list[dict] = []
@@ -61,21 +72,44 @@ class HistoryManager:
             encoding="utf-8",
         )
 
-    # ---------- 群消息追加（入 pending buffer） ----------
+    # ---------- 群消息追加（入 fast_buffer，接收线程调用） ----------
     def append_group_message(self, qq: str, nickname: str, content: str, msg_id: str):
-        """追加群消息到 pending buffer（等待下一次"看一眼"触发时拼入 user）。"""
-        self.pending_group_msgs.append({
+        """追加群消息到 fast_buffer（接收线程调用，无 LLM 锁竞争）。
+
+        只加 _buffer_lock，持锁时间极短（仅 list.append）。
+        消息不会立即进入 pending，要等 LLM 工作线程 drain_buffer_to_pending。
+        """
+        entry = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "qq": qq,
             "nickname": nickname,
             "content": content,
             "is_bot": False,
             "msg_id": msg_id,
-        })
+        }
+        with self._buffer_lock:
+            self.fast_buffer.append(entry)
+
+    def drain_buffer_to_pending(self) -> int:
+        """把 fast_buffer 原子地移到 pending（LLM 工作线程调用）。
+
+        Returns:
+            本次 drain 的消息条数
+        """
+        with self._buffer_lock:
+            if not self.fast_buffer:
+                return 0
+            drained = self.fast_buffer
+            self.fast_buffer = []
+        self.pending_group_msgs.extend(drained)
         self._save()
+        return len(drained)
 
     def append_bot_reply_to_pending(self, qq: str, nickname: str, content: str):
-        """机器人自身回复也追加到 pending（写回历史形成闭环，但待下次触发时才进入 user）。"""
+        """机器人自身回复也追加到 pending（写回历史形成闭环，但待下次触发时才进入 user）。
+
+        注意：此方法在 LLM 工作线程内调用，无需加 _buffer_lock。
+        """
         self.pending_group_msgs.append({
             "time": datetime.now().strftime("%H:%M:%S"),
             "qq": qq,
@@ -86,79 +120,6 @@ class HistoryManager:
         })
         self._save()
 
-    # ---------- 连发消息检测 ----------
-    # 同一发送者在 BURST_INTERVAL_SECONDS 内连续发多条消息 → 视为"连发中"
-    # 在 render_user_content 时给这些消息打 [连发中] 标记，配合提示词引导 LLM silent
-    BURST_INTERVAL_SECONDS = 15  # 连发判定时间窗口（秒）
-
-    def mark_burst_messages(self) -> set:
-        """检测 pending 中"连发中"的消息，返回需要标记的 message index 集合。
-
-        判定规则：同一发送者相邻两条消息间隔 ≤ BURST_INTERVAL_SECONDS，
-        则这两条（以及前后连续的）都算连发。bot 自身回复不参与连发判定。
-
-        Returns:
-            set of int：需要标记 [连发中] 的 pending_group_msgs 索引集合
-        """
-        if len(self.pending_group_msgs) < 2:
-            return set()
-
-        marked = set()
-        # 按发送者分组相邻消息，检查时间间隔
-        # 只对非 bot 消息做连发判断
-        non_bot_indices = [i for i, m in enumerate(self.pending_group_msgs) if not m["is_bot"]]
-        if len(non_bot_indices) < 2:
-            return set()
-
-        # 对每个发送者，扫描其连续消息
-        # 策略：用滑动窗口，若相邻两条（同一发送者、时间间隔 ≤ 阈值）则都标记
-        # 一旦断裂（不同人 or 间隔 > 阈值），结束当前连发段
-        burst_chain = []  # 当前连发段的 pending 索引列表
-
-        for i in non_bot_indices:
-            if not burst_chain:
-                burst_chain = [i]
-                continue
-
-            prev_i = burst_chain[-1]
-            prev_msg = self.pending_group_msgs[prev_i]
-            cur_msg = self.pending_group_msgs[i]
-
-            same_sender = (prev_msg["qq"] == cur_msg["qq"])
-            interval_ok = self._time_interval_seconds(prev_msg["time"], cur_msg["time"]) <= self.BURST_INTERVAL_SECONDS
-
-            if same_sender and interval_ok:
-                burst_chain.append(i)
-            else:
-                # 连发段断裂，结算上一段
-                if len(burst_chain) >= 2:
-                    marked.update(burst_chain)
-                burst_chain = [i]
-
-        # 结算最后一段
-        if len(burst_chain) >= 2:
-            marked.update(burst_chain)
-
-        return marked
-
-    @staticmethod
-    def _time_interval_seconds(t1: str, t2: str) -> int:
-        """计算 HH:MM:SS 格式两个时间的间隔秒数（绝对值）。"""
-        try:
-            h1, m1, s1 = map(int, t1.split(":"))
-            h2, m2, s2 = map(int, t2.split(":"))
-            sec1 = h1 * 3600 + m1 * 60 + s1
-            sec2 = h2 * 3600 + m2 * 60 + s2
-            return abs(sec2 - sec1)
-        except (ValueError, AttributeError):
-            # 旧格式 HH:MM 兼容：fallback 到分钟级精度
-            try:
-                h1, m1 = map(int, str(t1).split(":")[:2])
-                h2, m2 = map(int, str(t2).split(":")[:2])
-                return abs((h2 * 60 + m2) - (h1 * 60 + m1)) * 60
-            except Exception:
-                return 9999  # 解析失败，视为超长间隔（不连发）
-
     # ---------- 构建 user content（触发"看一眼"时调用） ----------
     def build_user_content(self) -> str:
         """把 pending buffer 拼成 user content，并清空 buffer。
@@ -166,23 +127,20 @@ class HistoryManager:
         格式（正序 1-based 编号，用于 reply 段的 target_msg_index）：
         # 最近群消息（按时间顺序，每行一条，编号可用于 reply 段引用）
         [1] [20:03:37] 张三(123456789): 你好啊
-        [2] [20:03:43] 张三(123456789): 你好              [连发中]
+        [2] [20:03:43] 张三(123456789): 你好
         [3] [20:04:00] [bot] 林夏(...): 嗯                # bot 消息不可引用
         [4] [20:04:05] 张三(123456789): 之前那条          [延迟回复]
+
+        注：连发由"批量 drain + 静默窗口"自然体现——LLM 会看到多条同一发送者
+        时间戳相邻的消息，无需额外标记。
         """
-        burst_indices = self.mark_burst_messages()
         lines = []
         for i, m in enumerate(self.pending_group_msgs):
             seq = i + 1  # 正序 1-based
             prefix = "[bot]" if m["is_bot"] else ""
-            tags = []
-            if i in burst_indices:
-                tags.append("[连发中]")
-            if m.get("is_delayed"):
-                tags.append("[延迟回复]")
-            tag_str = ("  " + " ".join(tags)) if tags else ""
+            tag = "  [延迟回复]" if m.get("is_delayed") else ""
             lines.append(
-                f"[{seq}] [{m['time']}] {prefix}{m['nickname']}({m['qq']}): {m['content']}{tag_str}"
+                f"[{seq}] [{m['time']}] {prefix}{m['nickname']}({m['qq']}): {m['content']}{tag}"
             )
         return "\n".join(lines)
 
@@ -256,16 +214,20 @@ class HistoryManager:
     def recent_message_count(self, seconds: int = 180) -> int:
         """最近 N 秒内群消息数量（用于话题热度评分）。
 
-        同时考虑 pending 与已落地的 messages。
+        同时考虑 fast_buffer + pending（接收线程调用时 pending 可能正被 LLM 线程读写，
+        故用 _buffer_lock 保护快照）。
         兼容旧格式 HH:MM 和新格式 HH:MM:SS。
         """
         now = datetime.now()
-        count = 0
+        # 快照 fast_buffer（与 pending 拼接），避免遍历过程中被修改
+        with self._buffer_lock:
+            snapshot = list(self.fast_buffer)
+        # pending 部分（LLM 线程读写时这里可能读到旧值，可接受——评分只用于粗筛）
+        combined = snapshot + self.pending_group_msgs
 
-        # pending 部分
-        for m in reversed(self.pending_group_msgs):
+        count = 0
+        for m in reversed(combined):
             try:
-                # 兼容 HH:MM 与 HH:MM:SS
                 time_str = m['time']
                 if time_str.count(":") == 1:
                     msg_time = datetime.strptime(f"{now.strftime('%Y-%m-%d')} {time_str}", "%Y-%m-%d %H:%M")
@@ -346,7 +308,7 @@ class HistoryManager:
                 # 标注为延迟回复（render 时会显示 [延迟回复]）
                 m_copy = dict(m)
                 m_copy["is_delayed"] = True
-                # 更新时间为当前时间（让连发检测等逻辑正常工作）
+                # 更新时间为当前时间（避免旧时间戳让 LLM 误判消息间隔）
                 m_copy["time"] = now.strftime("%H:%M:%S")
                 self.pending_group_msgs.append(m_copy)
                 added += 1

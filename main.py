@@ -1,9 +1,15 @@
 """QQ 群聊机器人主入口。
 
 流程：
-- 被动触发：群聊消息 -> 入 silent_buffer -> 评分门槛 -> LLM 调用 -> 结果处理
+- 被动触发：群聊消息 -> 入 fast_buffer -> 评分 -> 触发决策（硬因子短冷却立即 / 软因子静默窗口兜底）
+              -> LLM 调用（_llm_lock 串行）-> drain buffer 到 pending -> 结果处理
 - 主动触发：定时器唤醒 -> LLM 调用（无新消息，让 LLM 自主决定要不要主动开口）
 - 延迟回复：LLM 输出 reply_delay_minutes -> 消息暂存 -> 下次触发时重新加入 pending
+
+并发模型：
+- 接收线程（webhook）只写 fast_buffer（HistoryManager 内 _buffer_lock 保护，持锁极短）
+- LLM 工作线程持 _llm_lock，串行执行 drain -> LLM -> 发送
+- 静默窗口定时器：每条新消息重置，5s 无新消息则触发兜底 LLM 调用
 """
 import time
 import random
@@ -27,6 +33,12 @@ from src.senders.emoji_reactor import EmptyEmojiReactor
 from src.utils.logger import get_logger
 
 logger = get_logger("main")
+
+# 冷却配置
+HARD_COOLDOWN_SECONDS = 1       # 硬因子（@/提问）触发冷却，距上次回复 <2s 推迟
+SOFT_COOLDOWN_MIN = 5         # 软因子触发冷却下限
+SOFT_COOLDOWN_MAX = 60         # 软因子触发冷却上限
+QUIET_WINDOW_SECONDS = 5       # 静默窗口：N 秒无新消息后兜底触发
 
 
 class Bot:
@@ -57,9 +69,13 @@ class Bot:
         self.self_qq: str = ""
         self.self_nickname: str = ""
         self.trigger_evaluator: Optional[TriggerEvaluator] = None
-        self.last_reply_time: float = 0
-        # 消息处理锁：保证 on_group_message 和主动触发串行，避免并发 LLM 调用
-        self._msg_lock = threading.Lock()
+        self.last_reply_time: float = 0.0
+        # LLM 调用串行锁：保证同一时刻只有一个 LLM 调用（替代原 _msg_lock 在 LLM 部分的作用）
+        # 接收线程不再持此锁，只写 fast_buffer
+        self._llm_lock = threading.Lock()
+        # 静默窗口定时器：每条新消息重置，N 秒无新消息后兜底触发 LLM
+        self._quiet_timer: Optional[threading.Timer] = None
+        self._quiet_timer_lock = threading.Lock()
 
     def warmup(self):
         """启动预热。"""
@@ -73,65 +89,159 @@ class Bot:
         logger.info(f"预热完成，机器人 {self.self_nickname}({self.self_qq})")
 
     def on_group_message(self, msg: dict):
-        """处理收到的群消息。
+        """处理收到的群消息（接收线程，无 _llm_lock）。
 
-        整体加锁保证串行：避免并发 LLM 调用和 pending 写竞争。
-        webhook 层已异步（Thread），此处阻塞不影响消息接收。
+        职责：
+        1. 入 fast_buffer（HistoryManager 内 _buffer_lock 保护，持锁极短）
+        2. 评分（只读配置/亲密度，无锁）
+        3. 触发决策：
+           - 硬因子（@/提问）且距上次回复 ≥ HARD_COOLDOWN_SECONDS → 立即尝试触发
+           - 其他 → 只入 buffer，由静默窗口兜底
+        4. 无论如何重置静默定时器（每条新消息都推迟兜底触发）
         """
-        with self._msg_lock:
-            try:
-                # 防御性群过滤：即使 webhook 层漏掉，这里再校验一次
-                msg_group_id = str(msg.get("group_id", ""))
-                if msg_group_id and msg_group_id != self.config.napcat.group_id:
-                    logger.debug(f"on_group_message 丢弃非目标群消息：{msg_group_id}")
-                    return
+        try:
+            # 防御性群过滤
+            msg_group_id = str(msg.get("group_id", ""))
+            if msg_group_id and msg_group_id != self.config.napcat.group_id:
+                logger.debug(f"on_group_message 丢弃非目标群消息：{msg_group_id}")
+                return
 
-                sender_qq = str(msg.get("user_id", ""))
-                sender_nick = self.napcat.get_nickname(sender_qq)
-                content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
-                msg_id = str(msg.get("message_id", ""))
+            sender_qq = str(msg.get("user_id", ""))
+            sender_nick = self.napcat.get_nickname(sender_qq)
+            content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
+            msg_id = str(msg.get("message_id", ""))
 
-                # 1. 入 silent_buffer
-                self.history.append_group_message(sender_qq, sender_nick, content, msg_id)
+            # 1. 入 fast_buffer（无 _llm_lock，仅 HistoryManager 内 _buffer_lock）
+            self.history.append_group_message(sender_qq, sender_nick, content, msg_id)
 
-                # 2. 评分门槛
-                score, soft_factors = self.trigger_evaluator.evaluate(msg)
-                logger.debug(f"消息评分={score} soft_factors={[f.name for f in soft_factors]}")
+            # 2. 评分（接收线程，只读）
+            score, soft_factors = self.trigger_evaluator.evaluate(msg)
+            is_hard = self._is_hard_trigger(msg, content)
+            logger.debug(f"消息评分={score} hard={is_hard} soft_factors={[f.name for f in soft_factors]}")
 
-                if not self.trigger_evaluator.should_peek(score):
-                    return  # 未达阈值，等下一条
+            # 3. 触发决策
+            if is_hard:
+                self._try_trigger_immediate(hard=True)
+            # 软因子不立即触发，等静默窗口兜底
 
-                # 3. 调用 LLM（被动触发）
-                self._invoke_llm(soft_factors, is_active=False)
+            # 4. 重置静默定时器（无论硬软，新消息都推迟兜底触发）
+            self._reschedule_quiet_trigger()
 
-            except Exception as e:
-                logger.error(f"处理消息异常: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"处理消息异常: {e}", exc_info=True)
+
+    def _is_hard_trigger(self, msg: dict, content: str) -> bool:
+        """判断是否硬因子触发（@bot 或提问语气）。"""
+        if self.trigger_evaluator._check_at_me(msg):
+            return True
+        if self.trigger_evaluator._check_question_to_me(content):
+            return True
+        return False
+
+    def _try_trigger_immediate(self, hard: bool = False):
+        """立即尝试触发 LLM（硬因子路径）。
+
+        冷却检查：距上次回复 < HARD_COOLDOWN_SECONDS 则跳过（让静默窗口兜底）。
+        非阻塞抢 _llm_lock：抢不到说明已有 LLM 调用在进行，让静默窗口兜底。
+        """
+        now = time.time()
+        elapsed = now - self.last_reply_time
+        cooldown = HARD_COOLDOWN_SECONDS if hard else SOFT_COOLDOWN_MIN
+        if elapsed < cooldown:
+            logger.debug(f"硬因子触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），等静默窗口兜底")
+            return
+
+        # 非阻塞尝试拿 LLM 锁
+        if not self._llm_lock.acquire(blocking=False):
+            logger.debug("硬因子触发但 LLM 锁被占用，等静默窗口兜底")
+            return
+
+        try:
+            self._run_llm_cycle(soft_factors=None, is_active=False)
+        finally:
+            self._llm_lock.release()
+
+    def _reschedule_quiet_trigger(self, delay: float = QUIET_WINDOW_SECONDS):
+        """重置静默窗口定时器：N 秒后若仍无新消息则兜底触发。
+
+        每条新消息都调用此方法，cancel 旧定时器并重设。
+        """
+        with self._quiet_timer_lock:
+            if self._quiet_timer is not None:
+                self._quiet_timer.cancel()
+            timer = threading.Timer(delay, self._on_quiet_timeout)
+            timer.daemon = True
+            timer.start()
+            self._quiet_timer = timer
+
+    def _on_quiet_timeout(self):
+        """静默窗口到期：兜底触发 LLM。
+
+        冷却检查：距上次回复 < SOFT_COOLDOWN_MIN 则重调度到冷却到期。
+        阻塞拿 _llm_lock（此时已静默 N 秒，可等待）。
+        """
+        try:
+            now = time.time()
+            elapsed = now - self.last_reply_time
+            if elapsed < SOFT_COOLDOWN_MIN:
+                # 还在软冷却内，重调度到冷却到期
+                remaining = SOFT_COOLDOWN_MIN - elapsed
+                logger.debug(f"静默窗口到期但软冷却中（elapsed={elapsed:.1f}s），{remaining:.1f}s 后再触发")
+                self._reschedule_quiet_trigger(delay=remaining)
+                return
+
+            # 阻塞拿 LLM 锁
+            with self._llm_lock:
+                self._run_llm_cycle(soft_factors=None, is_active=False)
+        except Exception as e:
+            logger.error(f"静默窗口兜底触发异常: {e}", exc_info=True)
 
     def on_active_trigger(self):
         """主动触发回调（由调度器调用）。
 
-        获取锁后调用 LLM，标记 is_active=True 让 LLM 知道这是主动检查。
+        阻塞拿 _llm_lock 后调用 LLM，标记 is_active=True 让 LLM 知道这是主动检查。
         """
-        with self._msg_lock:
-            try:
-                logger.info("主动触发：执行 LLM 调用")
-                # 主动触发时不传 soft_factors（无群消息触发，无评分）
-                self._invoke_llm(soft_factors=None, is_active=True)
-            except Exception as e:
-                logger.error(f"主动触发异常: {e}", exc_info=True)
+        try:
+            logger.info("主动触发：执行 LLM 调用")
+            with self._llm_lock:
+                self._run_llm_cycle(soft_factors=None, is_active=True)
+        except Exception as e:
+            logger.error(f"主动触发异常: {e}", exc_info=True)
+
+    def _run_llm_cycle(self, soft_factors, is_active: bool):
+        """LLM 工作循环（调用方已持 _llm_lock）。
+
+        流程：
+        1. drain fast_buffer → pending（原子，本次 LLM 看到的所有新消息）
+        2. 检查延迟回复到期 → 加入 pending
+        3. 若 pending 空（且非主动触发）→ 跳过
+        4. 调用 LLM → 解析 → 处理结果
+        """
+        # 1. drain fast_buffer
+        drained = self.history.drain_buffer_to_pending()
+        if drained > 0:
+            logger.debug(f"drain {drained} 条消息到 pending")
+
+        # 2. 延迟回复到期
+        due_count = self.history.pop_due_delayed_into_pending()
+        if due_count > 0:
+            logger.info(f"延迟回复到期，{due_count} 条消息已加入 pending")
+
+        # 3. pending 空检查（主动触发允许空 pending，让 LLM 决定是否主动开口）
+        if not self.history.pending_group_msgs and not is_active:
+            logger.debug("pending 为空，跳过 LLM 调用")
+            return
+
+        # 4. 调用 LLM（原 _invoke_llm 逻辑）
+        self._invoke_llm(soft_factors, is_active)
 
     def _invoke_llm(self, soft_factors, is_active: bool = False):
         """调用 LLM 并处理结果。使用多轮对话格式。
 
         Args:
-            soft_factors: 触发评分软因子（主动触发时为 None）
+            soft_factors: 触发评分软因子（新架构下接收线程评分结果不再透传，恒为 None）
             is_active: 是否为主动触发（影响 user content 渲染）
         """
-        # 调用前：检查延迟回复是否到期，把到期消息加入 pending
-        due_count = self.history.pop_due_delayed_into_pending()
-        if due_count > 0:
-            logger.info(f"延迟回复到期，{due_count} 条消息已加入 pending")
-
         # 构建 system prompt（含早期摘要）
         summary = self.history.get_summary()
         system_prompt = self.persona_renderer.render_system_prompt(summary)
@@ -151,8 +261,7 @@ class Bot:
         raw_result = self.llm.chat(system_prompt, history_messages, new_user_content)
         if raw_result is None:
             logger.warning("LLM 调用失败，本轮跳过")
-            # 即使失败，也要把 pending 消息落地为 user（不留空 user），但不落 assistant
-            # 这里选择不落地，pending 留待下次触发再拼入（消息不丢失）
+            # pending 留待下次触发再拼入（消息不丢失）
             return
 
         # 解析校验（在 consume 之前解析，以便根据 reply_delay 决定是否存到 delayed_replies）
@@ -169,11 +278,11 @@ class Bot:
 
         # 落地本轮 user/assistant 对话到历史
         # consume pending（清空 buffer，内容已进入 messages）
-        consumed_user_content = self.history.consume_pending_into_user()
-        # 用渲染后的 user content 落地（包含群成员上下文）
+        # 注：consume 的返回值是渲染前 pending 文本，但落地用 render 后的 new_user_content
+        self.history.consume_pending_into_user()
         self.history.append_turn(new_user_content, raw_result)
 
-        # 4. 结果处理（主动触发时 soft_factors 为 None，归因跳过）
+        # 结果处理（新架构下 soft_factors 恒为 None，归因跳过）
         self._handle_result(parsed, soft_factors)
 
     def _handle_result(self, parsed, soft_factors):
