@@ -38,7 +38,7 @@ logger = get_logger("main")
 HARD_COOLDOWN_SECONDS = 5       # 硬因子（@/提问）触发冷却，距上次回复 <2s 推迟
 SOFT_COOLDOWN_MIN = 16         # 软因子触发冷却下限
 SOFT_COOLDOWN_MAX = 60         # 软因子触发冷却上限
-QUIET_WINDOW_SECONDS = 5       # 静默窗口：N 秒无新消息后兜底触发
+QUIET_WINDOW_SECONDS = 20       # 静默窗口：N 秒无新消息后兜底触发
 
 
 class Bot:
@@ -317,12 +317,10 @@ class Bot:
             return
 
         # reply / multi_reply
+        # _send_messages 内部每条发送完成后会逐条 append 到 fast_buffer（is_bot=True），
+        # 与此期间群成员的新消息按真实 append 顺序混合，下一轮 drain 时进入 pending。
         self._send_messages(parsed.messages)
         self.last_reply_time = time.time()
-
-        # 机器人回复写回 pending（待下一轮触发时进入下一个 user）
-        reply_summary = " / ".join(_msg_to_text(m) for m in parsed.messages)
-        self.history.append_bot_reply_to_pending(self.self_qq, self.self_nickname, reply_summary)
 
         # 亲密度更新
         self.affinity.apply_delta(parsed.affinity_delta)
@@ -332,7 +330,13 @@ class Bot:
             self.attribution.update(soft_factors, parsed.action)
 
     def _send_messages(self, messages: list):
-        """发送消息列表，带间隔。"""
+        """发送消息列表，带间隔。
+
+        每条消息发送完成后立即 append 到 fast_buffer（is_bot=True），
+        与此期间接收线程写入的群消息按真实 append 顺序混合，
+        保证下一轮 LLM 看到的发言顺序 = 真实群聊发言顺序。
+        multi_reply 逐条 append，中间间隔期间群成员插话会自然夹在 bot 消息之间。
+        """
         segments_list = self.message_sender.build_segments(messages, self.history)
         for i, segs in enumerate(segments_list):
             # 处理特殊段
@@ -360,6 +364,8 @@ class Bot:
                     handled = True
                     break
             if handled:
+                # 特殊段也记入 fast_buffer（语音/图片/转发都算一条 bot 发言）
+                self._append_bot_reply_to_buffer(messages[i])
                 continue
 
             # 普通消息段
@@ -367,9 +373,23 @@ class Bot:
             if normal_segs:
                 self.message_sender.send_group_message(self.config.napcat.group_id, normal_segs)
 
+            # 逐条 append 到 fast_buffer（与群消息按真实时间顺序混合）
+            self._append_bot_reply_to_buffer(messages[i])
+
             # 多条消息间隔
             if i < len(segments_list) - 1:
                 time.sleep(random.uniform(0.8, 2.5))
+
+    def _append_bot_reply_to_buffer(self, msg):
+        """把单条 bot 发言追加到 fast_buffer（is_bot=True）。
+
+        在 _send_messages 每条发送完成后调用，确保发言顺序与真实群聊一致。
+        文本摘要复用 _msg_to_text，特殊段（image/voice/forward）也能得到合理摘要。
+        """
+        msg_text = _msg_to_text(msg)
+        self.history.append_group_message(
+            self.self_qq, self.self_nickname, msg_text, "", is_bot=True
+        )
 
     def _build_member_list(self) -> list:
         """构建传给 LLM 的群成员列表（含亲密度）。"""

@@ -9,9 +9,12 @@
 
 并发模型：
 - 接收线程（webhook）调 append_group_message 写 fast_buffer（_buffer_lock 保护）
+- LLM 工作线程发送 bot 回复后也调 append_group_message(is_bot=True) 写 fast_buffer
+  （与接收线程共用入口，按真实发言顺序与群消息混合在 fast_buffer 中）
 - LLM 工作线程调 drain_buffer_to_pending 原子地把 fast_buffer 移到 pending
 - pending 的所有后续读写都在 LLM 线程内，无需额外锁
 - recent_message_count 需同时看 fast_buffer 和 pending，用 _buffer_lock 保护
+  （并过滤 is_bot=True，避免 bot 自我催化话题热度评分）
 """
 import json
 import threading
@@ -72,19 +75,23 @@ class HistoryManager:
             encoding="utf-8",
         )
 
-    # ---------- 群消息追加（入 fast_buffer，接收线程调用） ----------
-    def append_group_message(self, qq: str, nickname: str, content: str, msg_id: str):
-        """追加群消息到 fast_buffer（接收线程调用，无 LLM 锁竞争）。
+    # ---------- 群消息追加（入 fast_buffer，接收线程 / LLM 线程均调用） ----------
+    def append_group_message(self, qq: str, nickname: str, content: str, msg_id: str, is_bot: bool = False):
+        """追加群消息到 fast_buffer（接收线程与 LLM 线程共用入口）。
 
         只加 _buffer_lock，持锁时间极短（仅 list.append）。
         消息不会立即进入 pending，要等 LLM 工作线程 drain_buffer_to_pending。
+
+        bot 自身回复（is_bot=True）也走此入口，由 LLM 工作线程在发送后调用，
+        与群成员消息按真实 append 顺序混合在 fast_buffer 中，下一轮 drain 时
+        一起进入 pending，保证 LLM 看到的发言顺序 = 真实群聊发言顺序。
         """
         entry = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "qq": qq,
             "nickname": nickname,
             "content": content,
-            "is_bot": False,
+            "is_bot": is_bot,
             "msg_id": msg_id,
         }
         with self._buffer_lock:
@@ -104,21 +111,6 @@ class HistoryManager:
         self.pending_group_msgs.extend(drained)
         self._save()
         return len(drained)
-
-    def append_bot_reply_to_pending(self, qq: str, nickname: str, content: str):
-        """机器人自身回复也追加到 pending（写回历史形成闭环，但待下次触发时才进入 user）。
-
-        注意：此方法在 LLM 工作线程内调用，无需加 _buffer_lock。
-        """
-        self.pending_group_msgs.append({
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "qq": qq,
-            "nickname": nickname,
-            "content": content,
-            "is_bot": True,
-            "msg_id": "",
-        })
-        self._save()
 
     # ---------- 构建 user content（触发"看一眼"时调用） ----------
     def build_user_content(self) -> str:
@@ -227,6 +219,10 @@ class HistoryManager:
 
         count = 0
         for m in reversed(combined):
+            # 过滤 bot 自身回复：话题热度应反映群成员活跃度，
+            # 否则 bot 回复会自我催化触发（bot 刚说完就 +1 热度）
+            if m.get("is_bot"):
+                continue
             try:
                 time_str = m['time']
                 if time_str.count(":") == 1:
