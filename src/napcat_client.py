@@ -161,23 +161,27 @@ class NapCatWebhookServer:
 
     NapCat 收到群消息后会 POST 到本服务，触发回调。
     若设置 target_group_id，则只处理该群消息，其他群消息直接丢弃。
-    群消息走 on_message 回调，撤回通知（group_recall）走 on_recall 回调。
+    群消息走 on_message 回调，撤回通知（group_recall）走 on_recall 回调，
+    戳一戳通知（notify/poke）走 on_poke 回调。
     """
 
     def __init__(self, host: str, port: int, on_message: Callable[[dict], None],
                  target_group_id: Optional[str] = None,
-                 on_recall: Optional[Callable[[dict], None]] = None):
+                 on_recall: Optional[Callable[[dict], None]] = None,
+                 on_poke: Optional[Callable[[dict], None]] = None):
         self.host = host
         self.port = port
         self.on_message = on_message
         self.target_group_id = target_group_id
         self.on_recall = on_recall
+        self.on_poke = on_poke
         self._server: Optional[HTTPServer] = None
 
     def start(self):
         """启动 webhook 服务（阻塞）。"""
         on_message = self.on_message
         on_recall = self.on_recall
+        on_poke = self.on_poke
         target_group_id = self.target_group_id
 
         class Handler(BaseHTTPRequestHandler):
@@ -241,6 +245,17 @@ class NapCatWebhookServer:
                             )
                         elif on_recall:
                             Thread(target=on_recall, args=(data,), daemon=True).start()
+                    elif post_type == "notice" and data.get("notice_type") == "notify" \
+                            and data.get("sub_type") == "poke":
+                        # 戳一戳通知：群过滤后异步调用 on_poke
+                        msg_group_id = str(data.get("group_id", ""))
+                        if target_group_id and msg_group_id != target_group_id:
+                            logger.debug(
+                                f"丢弃非目标群戳一戳通知：group_id={msg_group_id} "
+                                f"(期望 {target_group_id})"
+                            )
+                        elif on_poke:
+                            Thread(target=on_poke, args=(data,), daemon=True).start()
                 except Exception as e:
                     logger.error(f"处理上报失败: {e}")
                 self.send_response(200)

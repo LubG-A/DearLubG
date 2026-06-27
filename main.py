@@ -144,6 +144,35 @@ class Bot:
         except Exception as e:
             logger.error(f"处理撤回通知失败: {e}", exc_info=True)
 
+    def on_group_poke(self, data: dict):
+        """处理群戳一戳通知（接收线程，异步调用）。
+
+        NapCat 上报 notify/poke notice，data 含 target_id（被戳者）、user_id（戳人者）、
+        group_id。只处理 target_id == 自己 QQ 的戳一戳（别人被戳忽略）。
+        追加伪消息到 fast_buffer 后硬触发（像被 @ 一样立即反应）。
+        """
+        try:
+            target_id = str(data.get("target_id", ""))
+            poker_id = str(data.get("user_id", ""))
+            group_id = str(data.get("group_id", ""))
+            # 群过滤
+            if self.config.napcat.group_id and group_id != self.config.napcat.group_id:
+                return
+            # 只处理戳自己（别人被戳不处理，避免噪音）
+            if target_id != self.self_qq:
+                logger.debug(f"忽略非戳自己的 poke: target={target_id} poker={poker_id}")
+                return
+            poker_nick = self.napcat.get_nickname(poker_id)
+            logger.info(f"收到戳一戳: poker={poker_nick}({poker_id})")
+            # 追加伪消息到 fast_buffer
+            self.history.append_poke_notice(poker_id, poker_nick)
+            # 硬触发：像被 @ 一样立即反应
+            self._try_trigger_immediate(hard=True)
+            # 重置静默定时器
+            self._reschedule_quiet_trigger()
+        except Exception as e:
+            logger.error(f"处理戳一戳失败: {e}", exc_info=True)
+
     def on_group_message(self, msg: dict):
         """处理收到的群消息（接收线程，无 _cycle_lock）。
 
@@ -574,6 +603,7 @@ class Bot:
             webhook_host, webhook_port, self.on_group_message,
             target_group_id=self.config.napcat.group_id,
             on_recall=self.on_group_recall,
+            on_poke=self.on_group_poke,
         )
         # 启动主动触发调度器
         if self.config.active_trigger and self.config.active_trigger.enabled:

@@ -159,6 +159,27 @@ class HistoryManager:
             self.fast_buffer.append(entry)
         logger.info(f"撤回通知入 fast_buffer: recalled_msg_id={recalled_msg_id} operator={operator_qq}")
 
+    def append_poke_notice(self, poker_qq: str, poker_nickname: str):
+        """追加戳一戳通知伪消息到 fast_buffer（接收线程调用）。
+
+        伪消息用戳人者的昵称，content="戳了戳我"，msg_id 为空（不可引用）。
+        LLM 看到形如 "[time] 张三(123): 戳了戳我"，自然理解为被戳。
+        下一轮 drain 时进入 pending。
+
+        线程安全：持 _buffer_lock，与 drain 操作不冲突。
+        """
+        entry = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "qq": poker_qq,
+            "nickname": poker_nickname,
+            "content": "戳了戳我",
+            "is_bot": False,
+            "msg_id": "",  # 伪消息无 msg_id，不可引用
+        }
+        with self._buffer_lock:
+            self.fast_buffer.append(entry)
+        logger.info(f"戳一戳通知入 fast_buffer: poker={poker_nickname}({poker_qq})")
+
     def update_group_message_content(self, msg_id: str, new_content: str) -> bool:
         """按 msg_id 更新群消息的 content（语音转写回填用）。
 
