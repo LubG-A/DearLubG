@@ -31,7 +31,7 @@ from src.scheduler import ActiveScheduler
 from src.senders.message_sender import NapCatMessageSender
 from src.senders.voice_sender import AIRecordVoiceSender, LocalFileVoiceSender
 from src.senders.image_sender import EmptyImageSender
-from src.senders.emoji_reactor import EmptyEmojiReactor
+from src.senders.emoji_reactor import EmojiReactor
 from src.utils.logger import get_logger
 
 logger = get_logger("main")
@@ -67,7 +67,7 @@ class Bot:
         )
         self.local_voice_sender = LocalFileVoiceSender(self.napcat)
         self.image_sender = EmptyImageSender()
-        self.emoji_reactor = EmptyEmojiReactor()
+        self.emoji_reactor = EmojiReactor(self.napcat)
 
         # 运行时状态
         self.self_qq: str = ""
@@ -501,9 +501,14 @@ class Bot:
             return
 
         if parsed.action == "react":
-            # 预留接口
+            # 调用 /set_msg_emoji_like 给目标消息加 emoji 反应
             msg_id = self.history.get_msg_id_by_id(parsed.react_target_msg_id)
-            self.emoji_reactor.react(self.config.napcat.group_id, msg_id or "", parsed.react_emoji_id)
+            if not msg_id:
+                logger.warning(
+                    f"react 段 react_target_msg_id={parsed.react_target_msg_id} 无效，跳过 emoji 反应"
+                )
+            else:
+                self.emoji_reactor.react(self.config.napcat.group_id, msg_id, parsed.react_emoji_id)
             if soft_factors is not None:
                 self.attribution.update(soft_factors, "react")
             self.affinity.apply_delta(parsed.affinity_delta)

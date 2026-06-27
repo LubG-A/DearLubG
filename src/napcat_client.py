@@ -105,6 +105,20 @@ class NapCatClient:
             "text": text,
         })
 
+    def set_msg_emoji_like(self, message_id: str, emoji_id: str, set_: bool = True) -> dict:
+        """给消息设置 emoji 反应（/set_msg_emoji_like）。
+
+        Args:
+            message_id: 目标消息 ID
+            emoji_id: emoji ID（字符串形式，NapCat 接受 number 或 string）
+            set_: True=添加反应，False=取消反应
+        """
+        return self._call("set_msg_emoji_like", {
+            "message_id": message_id,
+            "emoji_id": emoji_id,
+            "set": set_,
+        })
+
     def get_ai_characters(self) -> list:
         """获取群聊可用的 AI 语音角色列表（启动探测用）。
 
