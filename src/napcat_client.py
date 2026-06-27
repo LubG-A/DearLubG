@@ -47,12 +47,16 @@ class NapCatClient:
         return info.get("card") or info.get("nickname") or qq
 
     # ---------- OneBot API 调用 ----------
-    def _call(self, endpoint: str, payload: dict) -> dict:
+    def _call(self, endpoint: str, payload: dict, quiet: bool = False) -> dict:
         """通用 API 调用。
 
         检查业务 status：NapCat 返回 {"status":"ok"/"failed", "retcode":..., "message":...}。
         status != "ok" 时记日志并返回空 dict，让调用方能感知失败（调用方对返回值
         做 .get("data", ...) 时会拿到默认值，不会误认为成功）。
+
+        Args:
+            quiet: True 时业务失败记 INFO（用于重试场景，避免重试期间的正常失败
+                   刷 ERROR）；False（默认）记 ERROR，保持其他调用方的既有行为。
         """
         url = f"{self.base_url}/{endpoint}"
         try:
@@ -63,7 +67,11 @@ class NapCatClient:
             if isinstance(data, dict) and data.get("status") != "ok":
                 retcode = data.get("retcode", "?")
                 message = data.get("message", "") or data.get("wording", "")
-                logger.error(f"调用 {endpoint} 业务失败: retcode={retcode} message={message} payload={payload}")
+                log_msg = f"调用 {endpoint} 业务失败: retcode={retcode} message={message} payload={payload}"
+                if quiet:
+                    logger.info(log_msg)
+                else:
+                    logger.error(log_msg)
                 return {}
             return data
         except Exception as e:
@@ -131,16 +139,17 @@ class NapCatClient:
             "emoji_id": emoji_id,
         })
 
-    def fetch_ptt_text(self, message_id: str) -> str:
+    def fetch_ptt_text(self, message_id: str, quiet: bool = False) -> str:
         """获取语音转文字结果（/fetch_ptt_text）。
 
         Args:
             message_id: 语音消息的 message_id
+            quiet: True 时业务失败记 INFO（语音转写重试场景），否则记 ERROR。
 
         Returns:
             转写的文字；失败（含权限不足、非语音消息、NapCat 不支持）返回空串。
         """
-        resp = self._call("fetch_ptt_text", {"message_id": message_id})
+        resp = self._call("fetch_ptt_text", {"message_id": message_id}, quiet=quiet)
         if not resp:
             return ""
         data = resp.get("data") or {}

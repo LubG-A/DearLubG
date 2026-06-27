@@ -181,29 +181,32 @@ class Bot:
         return any(seg.get("type") == "record" for seg in msg.get("message", []))
 
     def _transcribe_voice_async(self, msg_id: str):
-        """异步转写语音：延迟重试，成功后回填历史 content。
+        """异步转写语音：分级延迟重试，成功后回填历史 content。
 
         NapCat 收到语音消息后需先从腾讯下载 amr 文件到本地，立即调用 fetch_ptt_text
-        会因文件未就绪而失败（retcode=200）。策略：延迟 2s 首次尝试，失败再等 3s 重试 1 次。
+        会因文件未就绪而失败（retcode=200）。采用分级延迟重试（1s/1s/2s，共 3 次）：
+        每次尝试的失败属正常重试，记 INFO；只有 3 次全部失败才记 ERROR。
         成功则把历史中的 [语音消息] 占位回填为 [语音] 转写文字。
         """
-        delays = [3.0, 1.0]  # 首次延迟 3s，重试间隔 1s
+        delays = [1.0, 1.0, 2.0]  # 分级延迟：快探测→中等→慢兜底，总最坏 4s
+        total_attempts = len(delays)
         for attempt, delay in enumerate(delays, 1):
             time.sleep(delay)
             try:
-                text = self.napcat.fetch_ptt_text(msg_id)
+                # quiet=True：重试期间的 _call 业务失败记 INFO，避免刷 ERROR
+                text = self.napcat.fetch_ptt_text(msg_id, quiet=True)
                 if text:
                     new_content = f"[语音] {text}"
                     updated = self.history.update_group_message_content(msg_id, new_content)
                     if updated:
-                        logger.info(f"语音转文字成功并回填: {text[:50]}（第{attempt}次尝试）")
+                        logger.info(f"语音转文字成功并回填: {text[:50]}（第{attempt}/{total_attempts}次尝试）")
                     else:
                         logger.info(f"语音转文字成功但消息已被消费（msg_id={msg_id}）: {text[:50]}")
                     return
-                logger.debug(f"语音转文字第{attempt}次返回空（msg_id={msg_id}）")
+                logger.info(f"语音转文字第{attempt}/{total_attempts}次未就绪（msg_id={msg_id}）")
             except Exception as e:
-                logger.error(f"语音转文字第{attempt}次异常（msg_id={msg_id}）: {e}")
-        logger.warning(f"语音转文字最终失败，保留占位（msg_id={msg_id}）")
+                logger.info(f"语音转文字第{attempt}/{total_attempts}次异常（msg_id={msg_id}）: {e}")
+        logger.error(f"语音转文字 {total_attempts} 次重试均失败，保留占位（msg_id={msg_id}）")
 
     def _is_hard_trigger(self, msg: dict, content: str) -> bool:
         """判断是否硬因子触发（@bot 或提问语气）。"""
