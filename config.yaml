@@ -36,8 +36,9 @@ voice:
 trigger:
   peek_threshold: 10
   silent_buffer_limit: 30
-  history_limit: 999
-  history_keep_recent: 80
+  history_limit: 240                  # 总轮数达 240 时触发分层压缩
+  history_keep_recent: 60             # 保留近 60 轮原文
+  history_keep_mid: 80                # 中期 80 轮做 LLM 摘要（60-140 轮之间）
   attribution_step: 0.05
   cold_start_rounds: 20               # 冷启动保护：前 N 轮不更新 dynamic_weight，仅记日志
 

@@ -43,8 +43,9 @@ class TriggerConfig:
     silent_buffer_limit: int
     history_limit: int
     history_keep_recent: int
-    attribution_step: float
-    cold_start_rounds: int
+    history_keep_mid: int = 0   # 中期摘要轮数（方案A分层压缩，0=禁用分层走旧逻辑）
+    attribution_step: float = 0.1
+    cold_start_rounds: int = 20
 
 
 @dataclass

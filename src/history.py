@@ -5,7 +5,10 @@
 - assistant：LLM 返回的完整 JSON（含 thought，无论 action 是什么）
 
 每轮 LLM 调用必有 assistant 落地，silent 也是真实回复。
-超过阈值时对早期 user/assistant 对做摘要压缩，塞进 system 末尾。
+超过阈值时对早期 user/assistant 对做分层压缩（方案A）：
+- 近期 N 轮：保留原文
+- 中期 M 轮：LLM 摘要（保留互动/话题/立场/情绪）
+- 更早：朴素摘要（截断要点）拼入 summary 字段
 
 并发模型：
 - 接收线程（webhook）调 append_group_message 写 fast_buffer（_buffer_lock 保护）
@@ -15,12 +18,19 @@
 - pending 的所有后续读写都在 LLM 线程内，无需额外锁
 - recent_message_count 需同时看 fast_buffer 和 pending，用 _buffer_lock 保护
   （并过滤 is_bot=True，避免 bot 自我催化话题热度评分）
+
+压缩的并发安全（方案A）：
+- 压缩在 LLM 工作线程的 append_turn 末尾执行（单线程，不引入新并发）
+- 压缩期间 fast_buffer 仍可接收消息（_buffer_lock 保护，与压缩互不干扰）
+- 压缩期间 pending 不被读写（drain 已完成，consume 已完成）
+- 摘要调用 LLM 约 3-5 秒，期间阻塞 cycle，但下一轮 cycle 才用到新 messages，无竞态
+- 持久化用临时文件+rename 原子写入，避免崩溃导致文件损坏
 """
 import json
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
 from .config import TriggerConfig
 from .utils.logger import get_logger
@@ -39,6 +49,7 @@ class HistoryManager:
         # messages: [{"role":"user","content":"..."}, {"role":"assistant","content":"...JSON..."}, ...]
         self.messages: list[dict] = []
         # 早期对话摘要（压缩后塞进 system 末尾）
+        # 包含中期 LLM 摘要 + 远期朴素摘要，按时间倒序拼接（最近摘要在前）
         self.summary: str = ""
         # 待拼入下一个 user 的群消息缓冲（未触发"看一眼"的消息累积于此）
         # 格式：[{"time":"HH:MM","qq":"...","nickname":"...","content":"...","is_bot":bool,"msg_id":"..."}]
@@ -54,7 +65,18 @@ class HistoryManager:
         # 解决"consume_pending_into_user 清空 pending 后，_handle_result 中 reply/react 段取不到 msg_id"的问题。
         # 快照在 LLM 工作线程内创建和消费，无跨线程访问，无需额外锁。
         self._rendered_pending_snapshot: list[dict] = []
+        # 摘要器：由 main.py 注入 LLMClient.summarize，None 时走朴素摘要
+        self._summarizer: Optional[Callable[[list[dict]], Optional[str]]] = None
         self._load()
+
+    def set_summarizer(self, summarizer: Callable[[list[dict]], Optional[str]]):
+        """注入 LLM 摘要器（main.py 启动时调用）。
+
+        Args:
+            summarizer: 接收 messages 列表，返回摘要字符串或 None（失败）
+        """
+        self._summarizer = summarizer
+        logger.info("已注入 LLM 摘要器，分层压缩启用（方案A）")
 
     # ---------- 持久化 ----------
     def _load(self):
@@ -69,7 +91,9 @@ class HistoryManager:
                 logger.warning(f"加载历史失败: {e}")
 
     def _save(self):
-        self.file.write_text(
+        """原子写入：临时文件 + rename，避免压缩中途崩溃导致文件损坏。"""
+        tmp = self.file.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps({
                 "messages": self.messages,
                 "summary": self.summary,
@@ -78,6 +102,7 @@ class HistoryManager:
             }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        tmp.replace(self.file)  # 原子操作（同文件系统内）
 
     # ---------- 群消息追加（入 fast_buffer，接收线程 / LLM 线程均调用） ----------
     def append_group_message(self, qq: str, nickname: str, content: str, msg_id: str, is_bot: bool = False):
@@ -169,11 +194,18 @@ class HistoryManager:
 
     # ---------- 摘要压缩 ----------
     def _check_compress(self):
-        """轮次达阈值时，对早期 user/assistant 对做摘要压缩。
+        """轮次达阈值时，对早期 user/assistant 对做分层压缩（方案A）。
+
+        分层结构：
+        - 近期 history_keep_recent / 2 轮：保留原文
+        - 中期 history_keep_mid / 2 轮：LLM 摘要（调用注入的 summarizer）
+        - 更早：朴素摘要（截断要点）拼入 summary 字段
 
         触发条件：user/assistant 对数 >= history_limit / 2。
-        压缩策略：保留近 history_keep_recent / 2 轮原文，早期转摘要塞进 system 末尾。
-        当前阶段摘要为朴素实现（截断保留要点），阶段二接 LLM 做真实摘要。
+        容错：LLM 摘要失败则放弃本次压缩，下次 append_turn 再试。
+
+        并发安全：本方法在 LLM 工作线程的 append_turn 末尾执行，单线程无竞态。
+        摘要调用 LLM 约 3-5 秒，期间 fast_buffer 仍可接收消息，pending 不被读写。
         """
         turn_count = len(self.messages) // 2
         max_turns = self.config.history_limit // 2
@@ -181,20 +213,59 @@ class HistoryManager:
             return
 
         keep_turns = self.config.history_keep_recent // 2
+        mid_turns = self.config.history_keep_mid // 2
+
         keep_msgs = keep_turns * 2
-        old_msgs = self.messages[:-keep_msgs]
+        mid_msgs = mid_turns * 2
+
+        # 切分：[远期 old][中期 mid][近期 keep]
+        # 近期保留，中期 LLM 摘要，远期朴素摘要
+        old_msgs = self.messages[:-(keep_msgs + mid_msgs)]
+        mid_msgs_list = self.messages[-(keep_msgs + mid_msgs):-keep_msgs] if mid_msgs > 0 else []
+
+        # 1. 中期 LLM 摘要（若配置了 summarizer 且有中期消息）
+        mid_summary = ""
+        if mid_msgs_list and self._summarizer:
+            logger.info(f"分层压缩：对中期 {mid_turns} 轮调用 LLM 摘要...")
+            mid_summary = self._summarizer(mid_msgs_list) or ""
+            if not mid_summary:
+                # LLM 摘要失败，放弃本次压缩，下次重试
+                logger.warning("LLM 摘要失败，放弃本次压缩（下次 append_turn 再试）")
+                return
+
+        # 2. 远期朴素摘要（截断保留要点）
+        old_summary_chunk = ""
+        if old_msgs:
+            old_text_parts = []
+            for i in range(0, len(old_msgs), 2):
+                if i + 1 < len(old_msgs):
+                    # user content 取后 100 字（跳过群成员列表头部，取消息正文）
+                    u = old_msgs[i]["content"][-100:]
+                    a = old_msgs[i + 1]["content"][:100]
+                    old_text_parts.append(f"U:{u}\nA:{a}")
+            old_summary_chunk = " || ".join(old_text_parts[-5:])
+
+        # 3. 合并 summary：新中期摘要在前 + 已有 summary + 新远期摘要
+        #    结构：[最近的中期摘要] [更早的中期/远期摘要] [本次远期摘要]
+        #    summary 限 2000 字（容纳多轮压缩的累积）
+        parts = []
+        if mid_summary:
+            parts.append(mid_summary)
+        if self.summary:
+            parts.append(self.summary)
+        if old_summary_chunk:
+            parts.append(old_summary_chunk)
+        self.summary = " ".join(parts).strip()[-2000:]
+
+        # 4. 切除中期和远期，只保留近期原文
         self.messages = self.messages[-keep_msgs:]
 
-        # 朴素摘要：把早期对话拼成文本（阶段二改为调用 LLM 摘要）
-        old_text_parts = []
-        for i in range(0, len(old_msgs), 2):
-            if i + 1 < len(old_msgs):
-                u = old_msgs[i]["content"][:100]
-                a = old_msgs[i + 1]["content"][:100]
-                old_text_parts.append(f"U:{u}\nA:{a}")
-        old_summary_chunk = " || ".join(old_text_parts[-5:])
-        self.summary = (self.summary + " " + old_summary_chunk).strip()[-800:]
-        logger.info(f"对话压缩：保留近 {keep_turns} 轮，摘要 {len(self.summary)} 字")
+        logger.info(
+            f"分层压缩完成：保留近 {keep_turns} 轮原文"
+            f"{f'，中期摘要 {len(mid_summary)} 字' if mid_summary else ''}"
+            f"{f'，远期朴素摘要 {len(old_summary_chunk)} 字' if old_summary_chunk else ''}"
+            f"，summary 总长 {len(self.summary)} 字"
+        )
 
     # ---------- 查询 ----------
     def get_messages_for_llm(self) -> list[dict]:

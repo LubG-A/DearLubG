@@ -53,6 +53,8 @@ class Bot:
         self.napcat = NapCatClient(self.config.napcat.base_url, self.config.napcat.group_id)
         self.llm = LLMClient(self.config)
         self.history = HistoryManager(self.config.trigger)
+        # 注入 LLM 摘要器：启用方案A分层压缩（中期 LLM 摘要 + 远期朴素摘要）
+        self.history.set_summarizer(self.llm.summarize)
         self.attribution = AttributionManager(self.config)
         self.affinity = AffinityManager()
         self.persona_renderer = PersonaRenderer(self.config)
