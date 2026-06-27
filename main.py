@@ -122,6 +122,28 @@ class Bot:
         except Exception as e:
             logger.warning(f"AI 语音 character 探测失败: {e}（不阻塞启动）")
 
+    def on_group_recall(self, data: dict):
+        """处理群撤回通知（接收线程，异步调用）。
+
+        NapCat 上报 group_recall notice，data 含 message_id（被撤回的消息）、
+        operator_id（撤回操作者 QQ）、group_id。追加一条撤回通知伪消息到 fast_buffer，
+        下一轮 drain 时进入 pending，LLM 可据此理解"哪条消息被撤回了"。
+        """
+        try:
+            recalled_msg_id = str(data.get("message_id", ""))
+            operator_id = str(data.get("operator_id", ""))
+            group_id = str(data.get("group_id", ""))
+            if not recalled_msg_id:
+                logger.warning(f"撤回通知缺少 message_id: {data}")
+                return
+            # 群过滤（webhook 已过滤，这里防御性再检查）
+            if self.config.napcat.group_id and group_id != self.config.napcat.group_id:
+                return
+            logger.info(f"收到撤回通知: recalled_msg_id={recalled_msg_id} operator={operator_id}")
+            self.history.append_recall_notice(recalled_msg_id, operator_id)
+        except Exception as e:
+            logger.error(f"处理撤回通知失败: {e}", exc_info=True)
+
     def on_group_message(self, msg: dict):
         """处理收到的群消息（接收线程，无 _cycle_lock）。
 
@@ -345,7 +367,7 @@ class Bot:
         1. drain fast_buffer → pending（_buffer_lock 保护，持锁极短）
         2. 检查延迟回复到期 → 加入 pending
         3. 若 pending 空（且非主动触发）→ 检查重试或退出
-        4. 构建 user_content（创建 _rendered_pending_snapshot 快照，供 reply/react 引用）
+        4. 构建 user_content（渲染 [#msg_id] 标记，供 reply/react 段引用）
         5. 调用 LLM（不持锁，_cycle_running 保证串行）
         6. 落地 user/assistant turn（pending 清空，append_turn）
         7. 发送 + 归因（不持锁，发送期间群消息和 bot 回复都进 fast_buffer）
@@ -451,8 +473,8 @@ class Bot:
 
         if parsed.action == "react":
             # 预留接口
-            msg_id = self.history.get_msg_id_by_index(parsed.react_target_msg_index)
-            self.emoji_reactor.react(self.config.napcat.group_id, msg_id, parsed.react_emoji_id)
+            msg_id = self.history.get_msg_id_by_id(parsed.react_target_msg_id)
+            self.emoji_reactor.react(self.config.napcat.group_id, msg_id or "", parsed.react_emoji_id)
             if soft_factors is not None:
                 self.attribution.update(soft_factors, "react")
             self.affinity.apply_delta(parsed.affinity_delta)
@@ -551,6 +573,7 @@ class Bot:
         server = NapCatWebhookServer(
             webhook_host, webhook_port, self.on_group_message,
             target_group_id=self.config.napcat.group_id,
+            on_recall=self.on_group_recall,
         )
         # 启动主动触发调度器
         if self.config.active_trigger and self.config.active_trigger.enabled:

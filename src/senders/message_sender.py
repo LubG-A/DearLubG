@@ -27,7 +27,7 @@ class NapCatMessageSender:
 
         Args:
             messages: 模型输出的 messages 列表（字符串或 dict）
-            history: 历史记录管理器（用于 reply 段取 message_id）
+            history: 历史记录管理器（用于 reply 段校验 target_msg_id）
 
         Returns:
             list of list of segment dict
@@ -57,11 +57,13 @@ class NapCatMessageSender:
             return [{"type": "at", "data": {"qq": str(data.get("qq", "")), "text": data.get("text", "")}}]
 
         if msg_type == "reply":
-            target_idx = data.get("target_msg_index", 0)
-            msg_id = history.get_msg_id_by_index(target_idx) if history else ""
+            target_msg_id = data.get("target_msg_id", "")
+            msg_id = history.get_msg_id_by_id(target_msg_id) if history else None
             segs = []
             if msg_id:
                 segs.append({"type": "reply", "data": {"id": msg_id}})
+            else:
+                logger.warning(f"reply 段 target_msg_id={target_msg_id} 无效，跳过 reply 段（保留附文）")
             if data.get("text"):
                 segs.append({"type": "text", "data": {"text": data["text"]}})
             return segs

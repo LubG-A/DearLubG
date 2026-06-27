@@ -22,7 +22,7 @@ class ParsedResult:
     targets: list = field(default_factory=list)
     messages: list = field(default_factory=list)
     react_emoji_id: str = ""
-    react_target_msg_index: int = 0
+    react_target_msg_id: str = ""
     delay_seconds: int = 0
     affinity_delta: dict = field(default_factory=dict)
     reply_delay_minutes: int = 0  # 延迟回复：N 分钟后再回这批消息
@@ -92,20 +92,18 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
         if msg_type not in VALID_MSG_TYPES:
             logger.warning(f"未知消息段 type={msg_type}，丢弃")
             continue
-        # reply 段：校验 target_msg_index（正序 1-based，由 sender 配合 history 校验范围）
+        # reply 段：校验 target_msg_id（非空 str，由 sender 配合 history 透传给 NapCat 校验）
         if msg_type == "reply":
             data_dict = msg.get("data", {})
             if not isinstance(data_dict, dict):
                 data_dict = {}
-            idx = data_dict.get("target_msg_index", 0)
-            try:
-                idx = int(idx)
-            except (TypeError, ValueError):
-                idx = 0
-            if idx < 1:
-                logger.warning(f"reply 段 target_msg_index={idx} 无效（应≥1），清空 reply 段")
+            target_id = data_dict.get("target_msg_id", "")
+            if not isinstance(target_id, str):
+                target_id = str(target_id) if target_id else ""
+            if not target_id:
+                logger.warning(f"reply 段 target_msg_id 为空，丢弃 reply 段")
                 continue  # 无效的 reply 段直接丢弃
-            data_dict["target_msg_index"] = idx
+            data_dict["target_msg_id"] = target_id
             msg["data"] = data_dict
         cleaned_messages.append(msg)
 
@@ -137,14 +135,12 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
     # 若 action != silent 但有 reply_delay_minutes，忽略（按 reply/react 正常处理）
     final_reply_delay = reply_delay if action == "silent" else 0
 
-    # react_target_msg_index 校验（正序 1-based，与 user content 编号一致）
-    react_idx = data.get("react_target_msg_index", 1)
-    try:
-        react_idx = int(react_idx)
-    except (TypeError, ValueError):
-        react_idx = 1
-    if react_idx < 1:
-        react_idx = 1
+    # react_target_msg_id 校验（非空 str，与 user content 的 [#msg_id] 标记一致）
+    react_id = data.get("react_target_msg_id", "")
+    if not isinstance(react_id, str):
+        react_id = str(react_id) if react_id else ""
+    if not react_id:
+        logger.warning("react_target_msg_id 为空，react 段将无法定位消息")
 
     return ParsedResult(
         thought=data.get("thought", ""),
@@ -152,7 +148,7 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
         targets=data.get("targets", []),
         messages=cleaned_messages,
         react_emoji_id=str(data.get("react_emoji_id", "")),
-        react_target_msg_index=react_idx,
+        react_target_msg_id=react_id,
         delay_seconds=int(delay),
         affinity_delta=cleaned_delta,
         reply_delay_minutes=final_reply_delay,

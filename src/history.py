@@ -61,10 +61,6 @@ class HistoryManager:
         # 延迟回复缓冲：LLM 觉得"等会再回"时，把这批 pending 消息存到这里
         # 格式：[{"due_time":"ISO时间戳", "messages":[{同 pending 格式}]}]
         self.delayed_replies: list[dict] = []
-        # 渲染快照：build_user_content 时对 pending 做浅拷贝，供后续 get_msg_id_by_index 读取。
-        # 解决"consume_pending_into_user 清空 pending 后，_handle_result 中 reply/react 段取不到 msg_id"的问题。
-        # 快照在 LLM 工作线程内创建和消费，无跨线程访问，无需额外锁。
-        self._rendered_pending_snapshot: list[dict] = []
         # 摘要器：由 main.py 注入 LLMClient.summarize，None 时走朴素摘要
         self._summarizer: Optional[Callable[[list[dict]], Optional[str]]] = None
         self._load()
@@ -141,6 +137,28 @@ class HistoryManager:
         self._save()
         return len(drained)
 
+    def append_recall_notice(self, recalled_msg_id: str, operator_qq: str):
+        """追加撤回通知伪消息到 fast_buffer（接收线程调用）。
+
+        伪消息格式与普通群消息一致，nickname="系统"，content 标注被撤回的 msg_id。
+        msg_id 为空（不可引用，build_user_content 不加 [#] 前缀），is_bot=False（让 LLM 看到这条通知）。
+        LLM 通过 content 文本"msg_id=xxx 的消息被撤回"识别撤回事件（persona 规则 8.5 引导）。
+        下一轮 drain 时进入 pending。
+
+        线程安全：持 _buffer_lock，与 drain 操作不冲突。
+        """
+        entry = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "qq": operator_qq,
+            "nickname": "系统",
+            "content": f"msg_id={recalled_msg_id} 的消息被撤回",
+            "is_bot": False,
+            "msg_id": "",  # 伪消息无 msg_id，不可引用
+        }
+        with self._buffer_lock:
+            self.fast_buffer.append(entry)
+        logger.info(f"撤回通知入 fast_buffer: recalled_msg_id={recalled_msg_id} operator={operator_qq}")
+
     def update_group_message_content(self, msg_id: str, new_content: str) -> bool:
         """按 msg_id 更新群消息的 content（语音转写回填用）。
 
@@ -172,37 +190,31 @@ class HistoryManager:
     def build_user_content(self) -> str:
         """把 pending buffer 拼成 user content。
 
-        同时做一份 pending 浅拷贝存到 _rendered_pending_snapshot，
-        供后续 get_msg_id_by_index 读取（consume 清空 pending 后仍可查 msg_id）。
-
-        格式（正序 1-based 编号，用于 reply 段的 target_msg_index）：
-        # 最近群消息（按时间顺序，每行一条，编号可用于 reply 段引用）
-        [1] [20:03:37] 张三(123456789): 你好啊
-        [2] [20:03:43] 张三(123456789): 你好
-        [3] [20:04:00] [bot] 林夏(...): 嗯                # bot 消息不可引用
-        [4] [20:04:05] 张三(123456789): 之前那条          [延迟回复]
+        格式（msg_id 标记用于 reply 段引用，bot 消息无标记不可引用）：
+        # 最近群消息（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用）
+        [#1281341473] [20:03:37] 张三(123456789): 你好啊
+        [#1281341474] [20:03:43] 张三(123456789): 你好
+        [20:04:00] [bot] 林夏(...): 嗯                    # bot 消息不可引用（无 [#] 前缀）
+        [#1281341475] [20:04:05] 张三(123456789): 之前那条  [延迟回复]
 
         注：连发由"批量 drain + 静默窗口"自然体现——LLM 会看到多条同一发送者
         时间戳相邻的消息，无需额外标记。
         """
-        # 快照：LLM 看到的 [N] 编号 ↔ msg_id 映射，供 reply/react 段解析引用
-        self._rendered_pending_snapshot = list(self.pending_group_msgs)
         lines = []
-        for i, m in enumerate(self.pending_group_msgs):
-            seq = i + 1  # 正序 1-based
+        for m in self.pending_group_msgs:
             prefix = "[bot]" if m["is_bot"] else ""
+            msg_id_tag = f"[#{m['msg_id']}]" if (not m["is_bot"] and m.get("msg_id")) else ""
             tag = "  [延迟回复]" if m.get("is_delayed") else ""
             lines.append(
-                f"[{seq}] [{m['time']}] {prefix}{m['nickname']}({m['qq']}): {m['content']}{tag}"
+                f"{msg_id_tag} [{m['time']}] {prefix}{m['nickname']}({m['qq']}): {m['content']}{tag}"
             )
         return "\n".join(lines)
 
     def consume_pending_into_user(self):
         """清空 pending（user_content 已由调用方通过 build_user_content 预构建）。
 
-        B2 方案：build_user_content 在 LLM 调用前执行（创建快照+渲染文本），
+        B2 方案：build_user_content 在 LLM 调用前执行（渲染文本），
         consume 在 LLM 调用后执行（只清空 pending，不重新 build）。
-        避免重复 build，且保证 reply/react 段引用的快照与本轮 user_content 一致。
         """
         self.pending_group_msgs = []
 
@@ -299,24 +311,22 @@ class HistoryManager:
         """返回传给 LLM 的 messages 列表（不含 system，system 由调用方拼接）。"""
         return self.messages.copy()
 
-    def get_msg_id_by_index(self, index: int) -> Optional[str]:
-        """按 user content 中的正序编号取 msg_id（用于 reply / react 段）。
+    def get_msg_id_by_id(self, target_msg_id: str) -> Optional[str]:
+        """校验 target_msg_id 是否可引用（用于 reply / react 段）。
 
-        index 含义：1=第一条群消息，2=第二条...（与 user content 显示的 [N] 编号一致）
-        bot 消息不可引用（返回 None）。
-        越界或无效返回 None，sender 会跳过 reply 段。
+        新方案：msg_id 由 LLM 直接输出（从 user content 的 [#msg_id] 标记复制），
+        无需 index→msg_id 反查映射。本方法只做空值校验，有效性交给 NapCat。
 
-        注意：读 _rendered_pending_snapshot 而非 live pending——
-        本方法在 consume_pending_into_user 之后调用（_handle_result 阶段），
-        此时 pending 已清空，只有快照保留着 LLM 看到的编号→msg_id 映射。
+        Args:
+            target_msg_id: LLM 输出的 msg_id 字符串
+
+        Returns:
+            非空 msg_id 字符串（透传，由 NapCat 做最终校验）；
+            空串或无效返回 None，sender 会跳过 reply 段。
         """
-        snapshot = self._rendered_pending_snapshot
-        if index < 1 or index > len(snapshot):
+        if not target_msg_id or not isinstance(target_msg_id, str):
             return None
-        m = snapshot[index - 1]
-        if m["is_bot"]:
-            return None  # 不允许引用 bot 自己的消息
-        return m.get("msg_id", "") or None
+        return target_msg_id
 
     def recent_message_count(self, seconds: int = 180) -> int:
         """最近 N 秒内群消息数量（用于话题热度评分）。
