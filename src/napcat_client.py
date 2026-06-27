@@ -131,6 +131,21 @@ class NapCatClient:
             "emoji_id": emoji_id,
         })
 
+    def fetch_ptt_text(self, message_id: str) -> str:
+        """获取语音转文字结果（/fetch_ptt_text）。
+
+        Args:
+            message_id: 语音消息的 message_id
+
+        Returns:
+            转写的文字；失败（含权限不足、非语音消息、NapCat 不支持）返回空串。
+        """
+        resp = self._call("fetch_ptt_text", {"message_id": message_id})
+        if not resp:
+            return ""
+        data = resp.get("data") or {}
+        return data.get("text", "") or ""
+
 
 class NapCatWebhookServer:
     """接收 NapCat HTTP 上报的 webhook 服务。

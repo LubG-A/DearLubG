@@ -141,6 +141,33 @@ class HistoryManager:
         self._save()
         return len(drained)
 
+    def update_group_message_content(self, msg_id: str, new_content: str) -> bool:
+        """按 msg_id 更新群消息的 content（语音转写回填用）。
+
+        遍历 fast_buffer 和 pending_group_msgs（消息被 LLM 消费进 messages 后无法回填）。
+        线程安全：fast_buffer 加 _buffer_lock，pending_group_msgs 是 list 引用操作。
+
+        Returns:
+            True: 找到并更新；False: 未找到（可能已被 drain+消费）
+        """
+        updated = False
+        with self._buffer_lock:
+            for entry in self.fast_buffer:
+                if entry.get("msg_id") == msg_id:
+                    entry["content"] = new_content
+                    updated = True
+                    break
+        # pending_group_msgs 的写操作主要由 LLM 工作线程的 drain/consume 触发，
+        # 这里只做单条 content 赋值（dict 引用），与 drain 的 list extend 不冲突
+        for entry in self.pending_group_msgs:
+            if entry.get("msg_id") == msg_id:
+                entry["content"] = new_content
+                updated = True
+                break
+        if updated:
+            self._save()
+        return updated
+
     # ---------- 构建 user content（触发"看一眼"时调用） ----------
     def build_user_content(self) -> str:
         """把 pending buffer 拼成 user content。

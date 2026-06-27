@@ -145,8 +145,18 @@ class Bot:
             content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
             msg_id = str(msg.get("message_id", ""))
 
+            # 语音消息：先用占位入历史（不阻塞），独立线程延迟重试转写后回填
+            # NapCat 收到语音需先从腾讯下载 amr 文件，立即调用 fetch_ptt_text 会因文件未就绪而失败
+            has_voice = self._has_voice_segment(msg)
+            if has_voice:
+                content = (content + (" " if content else "") + "[语音消息]").strip()
+
             # 1. 入 fast_buffer（无 _cycle_lock，仅 HistoryManager 内 _buffer_lock）
             self.history.append_group_message(sender_qq, sender_nick, content, msg_id)
+
+            # 语音转写：异步延迟重试，成功后回填历史 content
+            if has_voice and msg_id:
+                threading.Thread(target=self._transcribe_voice_async, args=(msg_id,), daemon=True).start()
 
             # 2. 评分（接收线程，只读）
             score, soft_factors = self.trigger_evaluator.evaluate(msg)
@@ -165,6 +175,35 @@ class Bot:
 
         except Exception as e:
             logger.error(f"处理消息异常: {e}", exc_info=True)
+
+    def _has_voice_segment(self, msg: dict) -> bool:
+        """消息是否含语音段（record）。"""
+        return any(seg.get("type") == "record" for seg in msg.get("message", []))
+
+    def _transcribe_voice_async(self, msg_id: str):
+        """异步转写语音：延迟重试，成功后回填历史 content。
+
+        NapCat 收到语音消息后需先从腾讯下载 amr 文件到本地，立即调用 fetch_ptt_text
+        会因文件未就绪而失败（retcode=200）。策略：延迟 2s 首次尝试，失败再等 3s 重试 1 次。
+        成功则把历史中的 [语音消息] 占位回填为 [语音] 转写文字。
+        """
+        delays = [3.0, 1.0]  # 首次延迟 3s，重试间隔 1s
+        for attempt, delay in enumerate(delays, 1):
+            time.sleep(delay)
+            try:
+                text = self.napcat.fetch_ptt_text(msg_id)
+                if text:
+                    new_content = f"[语音] {text}"
+                    updated = self.history.update_group_message_content(msg_id, new_content)
+                    if updated:
+                        logger.info(f"语音转文字成功并回填: {text[:50]}（第{attempt}次尝试）")
+                    else:
+                        logger.info(f"语音转文字成功但消息已被消费（msg_id={msg_id}）: {text[:50]}")
+                    return
+                logger.debug(f"语音转文字第{attempt}次返回空（msg_id={msg_id}）")
+            except Exception as e:
+                logger.error(f"语音转文字第{attempt}次异常（msg_id={msg_id}）: {e}")
+        logger.warning(f"语音转文字最终失败，保留占位（msg_id={msg_id}）")
 
     def _is_hard_trigger(self, msg: dict, content: str) -> bool:
         """判断是否硬因子触发（@bot 或提问语气）。"""
