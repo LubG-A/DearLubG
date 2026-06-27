@@ -73,5 +73,9 @@ class NapCatMessageSender:
             # forward 由专用 API 发送，这里返回标记
             return [{"type": "forward", "data": data}]
 
+        if msg_type == "voice":
+            # voice 由 main._send_messages 根据 channel 分发到 AIRecordVoiceSender / LocalFileVoiceSender
+            return [{"type": "voice", "data": data}]
+
         logger.warning(f"未知消息段 type={msg_type}，跳过")
         return []

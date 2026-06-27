@@ -48,12 +48,24 @@ class NapCatClient:
 
     # ---------- OneBot API 调用 ----------
     def _call(self, endpoint: str, payload: dict) -> dict:
-        """通用 API 调用。"""
+        """通用 API 调用。
+
+        检查业务 status：NapCat 返回 {"status":"ok"/"failed", "retcode":..., "message":...}。
+        status != "ok" 时记日志并返回空 dict，让调用方能感知失败（调用方对返回值
+        做 .get("data", ...) 时会拿到默认值，不会误认为成功）。
+        """
         url = f"{self.base_url}/{endpoint}"
         try:
             resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            # 检查业务状态（NapCat 失败时 HTTP 仍是 200）
+            if isinstance(data, dict) and data.get("status") != "ok":
+                retcode = data.get("retcode", "?")
+                message = data.get("message", "") or data.get("wording", "")
+                logger.error(f"调用 {endpoint} 业务失败: retcode={retcode} message={message} payload={payload}")
+                return {}
+            return data
         except Exception as e:
             logger.error(f"调用 {endpoint} 失败: {e}")
             return {}
@@ -84,6 +96,25 @@ class NapCatClient:
             "character": character,
             "text": text,
         })
+
+    def get_ai_characters(self) -> list:
+        """获取群聊可用的 AI 语音角色列表（启动探测用）。
+
+        返回 [{"character_id": "...", "character_name": "...", "preview_url": "..."}, ...]
+        失败返回空列表。
+        """
+        resp = self._call("get_ai_characters", {
+            "group_id": self.group_id,
+            "chat_type": 1,  # 群聊
+        })
+        if not resp:
+            return []
+        data = resp.get("data", [])
+        # data 是 [{"type":..., "characters":[...]}] 结构，展平取 characters
+        characters = []
+        for item in data if isinstance(data, list) else []:
+            characters.extend(item.get("characters", []))
+        return characters
 
     def send_group_forward_msg(self, messages: list, title: str = "") -> dict:
         """发送合并转发。"""

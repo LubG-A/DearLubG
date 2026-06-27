@@ -95,7 +95,32 @@ class Bot:
             self.config, self.history, self.self_qq, self.config.persona.name,
             affinity_manager=self.affinity,
         )
+        # 探测 AI 语音 character 是否可用（不阻塞启动）
+        self._probe_ai_voice_character()
         logger.info(f"预热完成，机器人 {self.self_nickname}({self.self_qq})")
+
+    def _probe_ai_voice_character(self):
+        """探测配置的 AI 语音 character 是否在可用列表中。
+
+        失败不阻塞启动，仅记 WARNING（语音调用时会触发 fallback_to_text）。
+        """
+        character = self.config.voice.ai_record_character
+        try:
+            characters = self.napcat.get_ai_characters()
+            if not characters:
+                logger.warning("无法获取 AI 语音角色列表（可能 NapCat 版本不支持），跳过 character 探测")
+                return
+            ids = [c.get("character_id", "") for c in characters]
+            if character in ids:
+                logger.info(f"AI 语音 character '{character}' 探测可用")
+            else:
+                names = [c.get("character_name", "") for c in characters]
+                logger.warning(
+                    f"AI 语音 character '{character}' 不在可用列表中！"
+                    f"可用角色: {list(zip(ids, names))}。语音调用将触发 fallback_to_text 降级。"
+                )
+        except Exception as e:
+            logger.warning(f"AI 语音 character 探测失败: {e}（不阻塞启动）")
 
     def on_group_message(self, msg: dict):
         """处理收到的群消息（接收线程，无 _cycle_lock）。

@@ -2,6 +2,12 @@
 
 双通道：ai_record（NapCat AI 语音）/ local_file（本地音频转 OB11MessageRecord）。
 通过 VoiceSender 接口隔离，未来可插入新 TTS 引擎。
+
+设计说明：
+- ai_record 通道：调用 NapCat 内置 /send_group_ai_record，零依赖，character 由 config 配置。
+- local_file 通道：发送本地音频文件（OB11 record 段）。当前 LLM 不会直接输出有效文件路径，
+  但此通道作为"可复用原语"保留——未来接入 TTS 引擎时，TTS 输出重定向到文件后即可
+  复用此 sender 发送 record 段，无需改动主流程。这避免了 TTS 引擎与主流程耦合。
 """
 from pathlib import Path
 
@@ -12,9 +18,12 @@ logger = get_logger("voice_sender")
 
 
 class AIRecordVoiceSender:
-    """AI 语音发送器，调用 /send_group_ai_record。"""
+    """AI 语音发送器，调用 /send_group_ai_record。
 
-    def __init__(self, client: NapCatClient, character: str, fallback_to_text: bool = False):
+    调用失败时（character 无效、网络错误等）按 fallback_to_text 决定是否降级为文字。
+    """
+
+    def __init__(self, client: NapCatClient, character: str, fallback_to_text: bool = True):
         self.client = client
         self.character = character
         self.fallback_to_text = fallback_to_text
@@ -25,26 +34,37 @@ class AIRecordVoiceSender:
         Args:
             group_id: 目标群号
             voice_data: 含 text 字段
+
+        Returns:
+            NapCat 返回的完整响应 dict；失败且降级时返回 text 段的响应；彻底失败返回 {}
         """
         text = voice_data.get("text", "")
         if not text:
             logger.warning("voice 段缺少 text，跳过")
             return {}
 
-        try:
-            return self.client.send_group_ai_record(self.character, text)
-        except Exception as e:
-            logger.error(f"AI 语音发送失败: {e}")
-            if self.fallback_to_text:
-                logger.info("降级为 text 段发送")
-                return self.client.send_group_msg([
-                    {"type": "text", "data": {"text": text}},
-                ])
-            return {}
+        # send_group_ai_record 内部已通过 _call 检查业务 status，失败返回 {}
+        result = self.client.send_group_ai_record(self.character, text)
+        if result:
+            logger.info(f"AI 语音发送成功: {text[:30]}...")
+            return result
+
+        # 发送失败
+        logger.error(f"AI 语音发送失败: character={self.character} text={text[:30]}...")
+        if self.fallback_to_text:
+            logger.info("降级为 text 段发送（fallback_to_text=true）")
+            return self.client.send_group_msg([
+                {"type": "text", "data": {"text": text}},
+            ])
+        return {}
 
 
 class LocalFileVoiceSender:
-    """本地音频文件发送器，构造 OB11MessageRecord 段。"""
+    """本地音频文件发送器，构造 OB11MessageRecord 段。
+
+    作为可复用原语保留：未来接入 TTS 引擎时，TTS 输出重定向到文件后，
+    可直接复用此 sender 发送 record 段，无需改动主流程。
+    """
 
     def __init__(self, client: NapCatClient):
         self.client = client
