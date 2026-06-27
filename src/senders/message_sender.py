@@ -71,6 +71,10 @@ class NapCatMessageSender:
         if msg_type == "face":
             return [{"type": "face", "data": {"id": str(data.get("id", ""))}}]
 
+        if msg_type == "poke":
+            # 戳一戳：data.qq 指定被戳者，透传给 NapCat
+            return [{"type": "poke", "data": {"qq": str(data.get("qq", ""))}}]
+
         if msg_type == "forward":
             # forward 由专用 API 发送，这里返回标记
             return [{"type": "forward", "data": data}]
