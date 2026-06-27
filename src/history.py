@@ -145,11 +145,14 @@ class HistoryManager:
             )
         return "\n".join(lines)
 
-    def consume_pending_into_user(self) -> str:
-        """构建 user content 并把 pending 清空（用于落盘到 messages）。"""
-        content = self.build_user_content()
+    def consume_pending_into_user(self):
+        """清空 pending（user_content 已由调用方通过 build_user_content 预构建）。
+
+        B2 方案：build_user_content 在 LLM 调用前执行（创建快照+渲染文本），
+        consume 在 LLM 调用后执行（只清空 pending，不重新 build）。
+        避免重复 build，且保证 reply/react 段引用的快照与本轮 user_content 一致。
+        """
         self.pending_group_msgs = []
-        return content
 
     # ---------- 落地一轮对话 ----------
     def append_turn(self, user_content: str, assistant_content: str):

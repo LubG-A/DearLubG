@@ -2,14 +2,16 @@
 
 流程：
 - 被动触发：群聊消息 -> 入 fast_buffer -> 评分 -> 触发决策（硬因子短冷却立即 / 软因子静默窗口兜底）
-              -> LLM 调用（_llm_lock 串行）-> drain buffer 到 pending -> 结果处理
+              -> LLM 调用（_cycle_running 串行）-> drain buffer 到 pending -> 结果处理
 - 主动触发：定时器唤醒 -> LLM 调用（无新消息，让 LLM 自主决定要不要主动开口）
 - 延迟回复：LLM 输出 reply_delay_minutes -> 消息暂存 -> 下次触发时重新加入 pending
 
-并发模型：
+并发模型（B2 方案）：
 - 接收线程（webhook）只写 fast_buffer（HistoryManager 内 _buffer_lock 保护，持锁极短）
-- LLM 工作线程持 _llm_lock，串行执行 drain -> LLM -> 发送
-- 静默窗口定时器：每条新消息重置，5s 无新消息则触发兜底 LLM 调用
+- LLM 工作线程用 _cycle_running 标志保证串行，LLM 调用和发送不持锁
+- _cycle_lock 只保护"检查+设置 _cycle_running"（持锁极短），不覆盖 LLM 调用
+- 撞 cycle 时注册 _cycle_pending，cycle 完成后立即重跑（不等静默窗口 20 秒）
+- 静默窗口定时器：每条新消息重置，20s 无新消息则触发兜底 LLM 调用
 """
 import time
 import random
@@ -70,9 +72,14 @@ class Bot:
         self.self_nickname: str = ""
         self.trigger_evaluator: Optional[TriggerEvaluator] = None
         self.last_reply_time: float = 0.0
-        # LLM 调用串行锁：保证同一时刻只有一个 LLM 调用（替代原 _msg_lock 在 LLM 部分的作用）
-        # 接收线程不再持此锁，只写 fast_buffer
-        self._llm_lock = threading.Lock()
+        # LLM cycle 串行控制（B2 方案）：用标志代替 _llm_lock 保证 cycle 串行，
+        # LLM 调用和发送不持锁，缩短"撞锁"窗口。
+        # _cycle_lock 只保护"检查+设置 _cycle_running"（持锁极短），不覆盖 LLM 调用。
+        # _cycle_running: True 表示有 LLM cycle 在跑，新触发撞标志后注册重试
+        # _cycle_pending: True 表示有触发在 cycle 期间撞上，cycle 完成后立即重跑
+        self._cycle_lock = threading.Lock()
+        self._cycle_running: bool = False
+        self._cycle_pending: bool = False
         # 静默窗口定时器：每条新消息重置，N 秒无新消息后兜底触发 LLM
         self._quiet_timer: Optional[threading.Timer] = None
         self._quiet_timer_lock = threading.Lock()
@@ -89,7 +96,7 @@ class Bot:
         logger.info(f"预热完成，机器人 {self.self_nickname}({self.self_qq})")
 
     def on_group_message(self, msg: dict):
-        """处理收到的群消息（接收线程，无 _llm_lock）。
+        """处理收到的群消息（接收线程，无 _cycle_lock）。
 
         职责：
         1. 入 fast_buffer（HistoryManager 内 _buffer_lock 保护，持锁极短）
@@ -111,7 +118,7 @@ class Bot:
             content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
             msg_id = str(msg.get("message_id", ""))
 
-            # 1. 入 fast_buffer（无 _llm_lock，仅 HistoryManager 内 _buffer_lock）
+            # 1. 入 fast_buffer（无 _cycle_lock，仅 HistoryManager 内 _buffer_lock）
             self.history.append_group_message(sender_qq, sender_nick, content, msg_id)
 
             # 2. 评分（接收线程，只读）
@@ -140,11 +147,46 @@ class Bot:
             return True
         return False
 
+    def _try_enter_cycle(self) -> bool:
+        """尝试进入 LLM cycle（B2 方案）。
+
+        用 _cycle_running 标志保证 cycle 串行，代替 _llm_lock 覆盖全流程。
+        _cycle_lock 只保护"检查+设置"（持锁极短），LLM 调用和发送不持锁。
+
+        Returns:
+            True: 成功进入 cycle（调用方负责执行 _run_llm_cycle + _exit_cycle）
+            False: 已有 cycle 在跑，已注册 _cycle_pending 重试（调用方直接返回）
+        """
+        with self._cycle_lock:
+            if self._cycle_running:
+                self._cycle_pending = True
+                return False
+            self._cycle_running = True
+            return True
+
+    def _exit_cycle(self):
+        """退出 LLM cycle，清除运行标志。"""
+        with self._cycle_lock:
+            self._cycle_running = False
+
+    def _consume_pending_trigger(self) -> bool:
+        """检查并消费重试标志（_run_llm_cycle while 循环末尾调用）。
+
+        Returns:
+            True: 有触发在 cycle 期间撞上，需要重跑
+            False: 无重试，退出循环
+        """
+        with self._cycle_lock:
+            if self._cycle_pending:
+                self._cycle_pending = False
+                return True
+            return False
+
     def _try_trigger_immediate(self, hard: bool = False, soft_factors=None):
         """立即尝试触发 LLM（硬因子或软因子路径）。
 
         冷却检查：距上次回复 < cooldown 则跳过（让静默窗口兜底）。
-        非阻塞抢 _llm_lock：抢不到说明已有 LLM 调用在进行，让静默窗口兜底。
+        cycle 串行检查：撞 _cycle_running 则注册重试，cycle 完成后立即重跑。
 
         Args:
             hard: True=硬因子触发（@/提问），False=软因子触发（评分过阈值）
@@ -159,15 +201,14 @@ class Bot:
             logger.debug(f"{trigger_label}触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），等静默窗口兜底")
             return
 
-        # 非阻塞尝试拿 LLM 锁
-        if not self._llm_lock.acquire(blocking=False):
-            logger.debug(f"{trigger_label}触发但 LLM 锁被占用，等静默窗口兜底")
+        if not self._try_enter_cycle():
+            logger.debug(f"{trigger_label}触发但 cycle 在跑，已注册完成后重试")
             return
 
         try:
             self._run_llm_cycle(soft_factors=soft_factors, is_active=False)
         finally:
-            self._llm_lock.release()
+            self._exit_cycle()
 
     def _reschedule_quiet_trigger(self, delay: float = QUIET_WINDOW_SECONDS):
         """重置静默窗口定时器：N 秒后若仍无新消息则兜底触发。
@@ -186,7 +227,7 @@ class Bot:
         """静默窗口到期：兜底触发 LLM。
 
         冷却检查：距上次回复 < SOFT_COOLDOWN_MIN 则重调度到冷却到期。
-        阻塞拿 _llm_lock（此时已静默 N 秒，可等待）。
+        cycle 串行检查：撞 _cycle_running 则注册重试，cycle 完成后立即重跑。
         """
         try:
             now = time.time()
@@ -198,100 +239,121 @@ class Bot:
                 self._reschedule_quiet_trigger(delay=remaining)
                 return
 
-            # 阻塞拿 LLM 锁
-            with self._llm_lock:
+            if not self._try_enter_cycle():
+                logger.debug("静默窗口到期但 cycle 在跑，已注册完成后重试")
+                return
+
+            try:
                 self._run_llm_cycle(soft_factors=None, is_active=False)
+            finally:
+                self._exit_cycle()
         except Exception as e:
             logger.error(f"静默窗口兜底触发异常: {e}", exc_info=True)
 
     def on_active_trigger(self):
         """主动触发回调（由调度器调用）。
 
-        阻塞拿 _llm_lock 后调用 LLM，标记 is_active=True 让 LLM 知道这是主动检查。
+        cycle 串行检查：撞 _cycle_running 则注册重试（重跑时 is_active 丢失，
+        语义上等同于"群里正在活跃对话，不需要主动开口"）。
         """
         try:
             logger.info("主动触发：执行 LLM 调用")
-            with self._llm_lock:
+            if not self._try_enter_cycle():
+                logger.debug("主动触发但 cycle 在跑，已注册完成后重试")
+                return
+
+            try:
                 self._run_llm_cycle(soft_factors=None, is_active=True)
+            finally:
+                self._exit_cycle()
         except Exception as e:
             logger.error(f"主动触发异常: {e}", exc_info=True)
 
     def _run_llm_cycle(self, soft_factors, is_active: bool):
-        """LLM 工作循环（调用方已持 _llm_lock）。
+        """LLM 工作循环（B2 方案：调用方已通过 _try_enter_cycle 获取运行权）。
 
-        流程：
-        1. drain fast_buffer → pending（原子，本次 LLM 看到的所有新消息）
+        流程（while 循环，处理撞 cycle 重试）：
+        1. drain fast_buffer → pending（_buffer_lock 保护，持锁极短）
         2. 检查延迟回复到期 → 加入 pending
-        3. 若 pending 空（且非主动触发）→ 跳过
-        4. 调用 LLM → 解析 → 处理结果
+        3. 若 pending 空（且非主动触发）→ 检查重试或退出
+        4. 构建 user_content（创建 _rendered_pending_snapshot 快照，供 reply/react 引用）
+        5. 调用 LLM（不持锁，_cycle_running 保证串行）
+        6. 落地 user/assistant turn（pending 清空，append_turn）
+        7. 发送 + 归因（不持锁，发送期间群消息和 bot 回复都进 fast_buffer）
+        8. 检查 _cycle_pending：有则继续循环（重跑不传 soft_factors，归因跳过），无则退出
+
+        注：LLM 调用和发送不持任何锁，接收线程写 fast_buffer 不受影响。
+        pending/messages/affinity/attribution 只在本线程访问，无竞争。
         """
-        # 1. drain fast_buffer
-        drained = self.history.drain_buffer_to_pending()
-        if drained > 0:
-            logger.debug(f"drain {drained} 条消息到 pending")
+        while True:
+            # 1. drain fast_buffer
+            drained = self.history.drain_buffer_to_pending()
+            if drained > 0:
+                logger.debug(f"drain {drained} 条消息到 pending")
 
-        # 2. 延迟回复到期
-        due_count = self.history.pop_due_delayed_into_pending()
-        if due_count > 0:
-            logger.info(f"延迟回复到期，{due_count} 条消息已加入 pending")
+            # 2. 延迟回复到期
+            due_count = self.history.pop_due_delayed_into_pending()
+            if due_count > 0:
+                logger.info(f"延迟回复到期，{due_count} 条消息已加入 pending")
 
-        # 3. pending 空检查（主动触发允许空 pending，让 LLM 决定是否主动开口）
-        if not self.history.pending_group_msgs and not is_active:
-            logger.debug("pending 为空，跳过 LLM 调用")
-            return
+            # 3. pending 空检查（主动触发允许空 pending，让 LLM 决定是否主动开口）
+            if not self.history.pending_group_msgs and not is_active:
+                logger.debug("pending 为空，跳过 LLM 调用")
+                if self._consume_pending_trigger():
+                    continue
+                return
 
-        # 4. 调用 LLM（原 _invoke_llm 逻辑）
-        self._invoke_llm(soft_factors, is_active)
+            # 4. 构建 user_content（创建快照供 reply/react 段引用）
+            summary = self.history.get_summary()
+            system_prompt = self.persona_renderer.render_system_prompt(summary)
+            history_messages = self.history.get_messages_for_llm()
+            member_list = self._build_member_list()
+            pending_text = self.history.build_user_content()
+            new_user_content = self.persona_renderer.render_user_content(
+                pending_text, member_list, self.self_nickname, self.self_qq,
+                is_active=is_active,
+            )
 
-    def _invoke_llm(self, soft_factors, is_active: bool = False):
-        """调用 LLM 并处理结果。使用多轮对话格式。
+            # 5. 调用 LLM（不持锁，_cycle_running 标志保证串行）
+            raw_result = self.llm.chat(system_prompt, history_messages, new_user_content)
+            if raw_result is None:
+                logger.warning("LLM 调用失败，本轮跳过")
+                # pending 留待下次触发再拼入（消息不丢失）
+                if self._consume_pending_trigger():
+                    continue
+                return
 
-        Args:
-            soft_factors: 触发评分软因子（新架构下接收线程评分结果不再透传，恒为 None）
-            is_active: 是否为主动触发（影响 user content 渲染）
-        """
-        # 构建 system prompt（含早期摘要）
-        summary = self.history.get_summary()
-        system_prompt = self.persona_renderer.render_system_prompt(summary)
+            # 6. 解析 + 落地
+            parsed = parse_and_validate(raw_result)
+            logger.info(f"LLM 返回 action={parsed.action} thought={parsed.thought[:50]}"
+                        f"{' reply_delay=' + str(parsed.reply_delay_minutes) + 'min' if parsed.reply_delay_minutes > 0 else ''}"
+                        f"{' [主动触发]' if is_active else ''}")
 
-        # 取历史 messages（user/assistant 交替，不含 system）
-        history_messages = self.history.get_messages_for_llm()
+            # 延迟回复处理：LLM 觉得"等会再回"，把这批消息存到 delayed_replies
+            if parsed.reply_delay_minutes > 0 and parsed.action == "silent":
+                self.history.stash_pending_as_delayed(parsed.reply_delay_minutes)
+                if self._consume_pending_trigger():
+                    continue
+                return
 
-        # 构建本轮 user content：群成员列表 + pending 群消息
-        member_list = self._build_member_list()
-        pending_text = self.history.build_user_content()
-        new_user_content = self.persona_renderer.render_user_content(
-            pending_text, member_list, self.self_nickname, self.self_qq,
-            is_active=is_active,
-        )
+            # 清空 pending（user_content 已在步骤 4 构建，不重新 build）
+            self.history.consume_pending_into_user()
+            self.history.append_turn(new_user_content, raw_result)
 
-        # 调用 LLM（传入完整历史 + 本轮新 user）
-        raw_result = self.llm.chat(system_prompt, history_messages, new_user_content)
-        if raw_result is None:
-            logger.warning("LLM 调用失败，本轮跳过")
-            # pending 留待下次触发再拼入（消息不丢失）
-            return
+            # 7. 发送 + 归因（不持锁，发送期间群消息和 bot 回复都进 fast_buffer）
+            self._handle_result(parsed, soft_factors)
 
-        # 解析校验（在 consume 之前解析，以便根据 reply_delay 决定是否存到 delayed_replies）
-        parsed = parse_and_validate(raw_result)
-
-        logger.info(f"LLM 返回 action={parsed.action} thought={parsed.thought[:50]}"
-                    f"{' reply_delay=' + str(parsed.reply_delay_minutes) + 'min' if parsed.reply_delay_minutes > 0 else ''}"
-                    f"{' [主动触发]' if is_active else ''}")
-
-        # 延迟回复处理：LLM 觉得"等会再回"，把这批消息存到 delayed_replies
-        # 注意：主动触发时 pending 可能为空，stash_pending_as_delayed 内部会检查
-        if parsed.reply_delay_minutes > 0 and parsed.action == "silent":
-            self.history.stash_pending_as_delayed(parsed.reply_delay_minutes)
-
-        # 落地本轮 user/assistant 对话到历史
-        # consume pending（清空 buffer，内容已进入 messages）
-        # 注：consume 的返回值是渲染前 pending 文本，但落地用 render 后的 new_user_content
-        self.history.consume_pending_into_user()
-        self.history.append_turn(new_user_content, raw_result)
-
-        # 结果处理（新架构下 soft_factors 恒为 None，归因跳过）
-        self._handle_result(parsed, soft_factors)
+            # 8. 检查重试：重跑不传 soft_factors（归因跳过），is_active=False
+            soft_factors = None
+            is_active = False
+            if not self._consume_pending_trigger():
+                return
+            # 冷却检查：距上次回复太近则退出（让静默窗口兜底）
+            if time.time() - self.last_reply_time < SOFT_COOLDOWN_MIN:
+                logger.debug("撞 cycle 重试但软冷却中，退出")
+                return
+            logger.debug("LLM 完成后立即处理之前撞 cycle 的触发")
+            # 继续循环
 
     def _handle_result(self, parsed, soft_factors):
         """处理 LLM 结果：执行动作 -> 写回历史 -> 亲密度 -> 归因。
