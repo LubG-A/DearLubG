@@ -202,7 +202,7 @@ class Bot:
             return
 
         if not self._try_enter_cycle():
-            logger.debug(f"{trigger_label}触发但 cycle 在跑，已注册完成后重试")
+            logger.debug(f"{trigger_label}触发但 cycle 在跑，已注册 _cycle_pending（cycle 完成后按回复/silent 分别处理）")
             return
 
         try:
@@ -343,16 +343,19 @@ class Bot:
             # 7. 发送 + 归因（不持锁，发送期间群消息和 bot 回复都进 fast_buffer）
             self._handle_result(parsed, soft_factors)
 
-            # 8. 检查重试：重跑不传 soft_factors（归因跳过），is_active=False
+            # 8. 检查重试：cycle 期间有新触发撞上则重跑（不传 soft_factors，归因跳过）
+            #    - 若本轮 cycle 发了回复（last_reply_time 新近）：刚说过话，新消息攒着等静默窗口兜底
+            #      （模拟真人"说完一轮先听一会"，不立即接话）
+            #    - 若本轮 cycle 返回 silent（last_reply_time 较旧）：没说过话，新消息立即重跑
+            #      （模拟真人"没开口时新消息值得看一眼"）
             soft_factors = None
             is_active = False
             if not self._consume_pending_trigger():
                 return
-            # 冷却检查：距上次回复太近则退出（让静默窗口兜底）
             if time.time() - self.last_reply_time < SOFT_COOLDOWN_MIN:
-                logger.debug("撞 cycle 重试但软冷却中，退出")
+                logger.debug("刚回完消息，新触发等静默窗口兜底（攒消息等下一轮）")
                 return
-            logger.debug("LLM 完成后立即处理之前撞 cycle 的触发")
+            logger.debug("上一轮 silent，立即重跑 cycle 处理撞锁的新触发")
             # 继续循环
 
     def _handle_result(self, parsed, soft_factors):
