@@ -2,12 +2,13 @@
 
 napcat:
   base_url: "http://127.0.0.1:8080"
-  group_id: ""        # 目标群号
+  group_id: "114514"        # 目标群号
 
+# 推荐一波配置
 llm:
-  api_url: ""
-  api_key: ""
-  model: ""
+  api_url: "https://api.deepseek.com/chat/completions"
+  api_key: "sk-yuanshen666yuanshenqidong"
+  model: "deepseek-v4-flash"
 
 # 测试用 Persona 卡（开发阶段验证框架，非最终人格）
 # 部署阶段会替换为真实 Persona
@@ -33,7 +34,7 @@ voice:
   fallback_to_text: false             # 备选项：AI 语音调用失败时降级为 text 段，默认关闭
 
 trigger:
-  peek_threshold: 0
+  peek_threshold: 10
   silent_buffer_limit: 30
   history_limit: 999
   history_keep_recent: 80
@@ -57,8 +58,8 @@ trigger_hard_factors:
 # 主动触发（让 bot 像真人一样有时会主动开口）
 active_trigger:
   enabled: true
-  min_interval_minutes: 120        # 主动触发最小间隔（分钟）
-  max_interval_minutes: 360        # 主动触发最大间隔（分钟）
+  min_interval_minutes: 60        # 主动触发最小间隔（分钟）
+  max_interval_minutes: 420        # 主动触发最大间隔（分钟）
   night_start_hour: 23             # 深夜起始小时（此区间内禁用主动触发）
   night_end_hour: 3                # 深夜结束小时
 
