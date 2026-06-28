@@ -653,6 +653,40 @@ def _msg_to_text(msg) -> str:
     return ""
 
 
+def _install_excepthooks():
+    """安装全局异常钩子，确保未捕获异常（含子线程）写入日志。
+
+    排查程序静默退出问题用：默认情况下子线程未捕获异常只打到 stderr，
+    若 stderr 未重定向到日志文件则丢失。此处统一捕获并记 CRITICAL。
+    """
+    import sys
+
+    def _sys_excepthook(exc_type, exc_value, tb):
+        try:
+            logger.critical("主线程未捕获异常", exc_info=(exc_type, exc_value, tb))
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, tb)
+
+    def _thread_excepthook(args):
+        try:
+            logger.critical(
+                f"子线程未捕获异常: thread={args.thread.name if args.thread else '?'}",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback)
+            )
+        except Exception:
+            pass
+
+    sys.excepthook = _sys_excepthook
+    threading.excepthook = _thread_excepthook
+    logger.info("全局异常钩子已安装（sys.excepthook + threading.excepthook）")
+
+
 if __name__ == "__main__":
-    bot = Bot()
-    bot.run()
+    _install_excepthooks()
+    try:
+        bot = Bot()
+        bot.run()
+    except Exception:
+        logger.critical("Bot 运行异常退出", exc_info=True)
+        raise
