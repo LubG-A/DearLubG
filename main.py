@@ -590,14 +590,25 @@ class Bot:
         )
 
     def _build_member_list(self) -> list:
-        """构建传给 LLM 的群成员列表（含亲密度）。"""
+        """构建传给 LLM 的群成员列表（含亲密度）。
+
+        过滤规则：只展示以下成员（避免 user content 顶部塞入全群名单）：
+        - 最近 N 轮发言过的成员（recent_speakers，从 history 派生）
+        - 有亲密度记录的成员（affinity > 0）
+        - 自己（self）
+        """
+        recent_speakers = self.history.get_recent_speakers()
         result = []
         for qq, info in self.napcat.member_cache.items():
+            affinity = self.affinity.get(qq)
+            # 过滤：近期发言过 / 有亲密度 / 是自己
+            if qq not in recent_speakers and affinity <= 0 and qq != self.self_qq:
+                continue
             result.append({
                 "qq": qq,
                 "nickname": info.get("card") or info.get("nickname") or qq,
                 "role": info.get("role", "member"),
-                "affinity": self.affinity.get(qq),
+                "affinity": affinity,
             })
         return result
 

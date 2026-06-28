@@ -332,6 +332,61 @@ class HistoryManager:
         """返回传给 LLM 的 messages 列表（不含 system，system 由调用方拼接）。"""
         return self.messages.copy()
 
+    def get_recent_speakers(self, recent_turns: int = 6) -> set:
+        """获取最近 N 轮对话中发言过的 QQ 集合（含当前 pending）。
+
+        扫描 messages 末尾 N 轮（每轮 = user + assistant）：
+        - user content：只扫描 "# 最近群消息" 标记之后的消息行，
+          用正则提取 nickname(qq) 模式中的 qq。跳过顶部群成员列表，
+          否则 member_list 里的人会被误捕为"近期发言者"导致只增不减。
+        - assistant content：JSON 解析 targets 字段
+
+        以及当前 pending_group_msgs 中的 qq。
+
+        用于 _build_member_list 过滤：只展示近期活跃 + 有亲密度记录的成员，
+        避免 user content 顶部塞入全群名单。
+
+        Args:
+            recent_turns: 扫描最近几轮（user/assistant 对），默认 6
+
+        Returns:
+            QQ 字符串集合
+        """
+        import re
+        qqs = set()
+
+        # 1. 当前 pending 中的发言者（本轮一定会被 LLM 看到）
+        for entry in self.pending_group_msgs:
+            qq = entry.get("qq")
+            if qq:
+                qqs.add(qq)
+
+        # 2. 扫描 messages 末尾 N 轮
+        recent_messages = self.messages[-(recent_turns * 2):] if recent_turns > 0 else []
+        for msg in recent_messages:
+            if msg["role"] == "user":
+                # user content 顶部有群成员列表（也是 nickname(qq) 格式），
+                # 必须按 "# 最近群消息" 分割，只扫描消息部分，否则会闭环累积
+                content = msg["content"]
+                marker = "# 最近群消息"
+                idx = content.find(marker)
+                if idx >= 0:
+                    content = content[idx:]
+                # user content 每行形如 [#msg_id] [time] nickname(qq): content
+                # 用正则提取括号里的 QQ（5 位以上数字，过滤短数字干扰）
+                for match in re.finditer(r'\((\d{5,})\)', content):
+                    qqs.add(match.group(1))
+            elif msg["role"] == "assistant":
+                # assistant content 是 JSON，里面有 targets
+                try:
+                    data = json.loads(msg["content"])
+                    for qq in data.get("targets", []):
+                        qqs.add(str(qq))
+                except (ValueError, TypeError):
+                    pass
+
+        return qqs
+
     def get_msg_id_by_id(self, target_msg_id: str) -> Optional[str]:
         """校验 target_msg_id 是否可引用（用于 reply / react 段）。
 
