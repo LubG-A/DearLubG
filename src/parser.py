@@ -136,10 +136,11 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
     final_reply_delay = reply_delay if action == "silent" else 0
 
     # react_target_msg_id 校验（非空 str，与 user content 的 [#msg_id] 标记一致）
+    # 仅 action=react 时需要，其他 action 不校验（LLM 无需输出该字段）
     react_id = data.get("react_target_msg_id", "")
     if not isinstance(react_id, str):
         react_id = str(react_id) if react_id else ""
-    if not react_id:
+    if action == "react" and not react_id:
         logger.warning("react_target_msg_id 为空，react 段将无法定位消息")
 
     return ParsedResult(
