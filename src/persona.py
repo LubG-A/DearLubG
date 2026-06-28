@@ -1,7 +1,12 @@
 """Persona 模块。负责系统提示词的渲染。"""
 from datetime import datetime
+from pathlib import Path
 
 from .config import Config
+from .background_compiler import load_background_summary
+from .utils.logger import get_logger
+
+logger = get_logger("persona")
 
 
 class PersonaRenderer:
@@ -14,6 +19,9 @@ class PersonaRenderer:
 口癖：{catchphrases}。
 说话风格：{style}。
 禁止：{forbidden}。
+
+# 你的过往
+{background}
 
 # 你在做什么
 你在参与一个 QQ 群聊。下面给你最近 N 条群消息，请像真人一样决定要不要回应。
@@ -164,8 +172,14 @@ class PersonaRenderer:
   "affinity_delta": {{"123456789": 1}}
 }}"""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, state_dir: str = "state"):
         self.config = config
+        # 启动时加载一次背景故事总结（不在每次 render 时读文件）
+        self._background = load_background_summary(Path(state_dir))
+        if self._background:
+            logger.info(f"已加载背景故事总结（{len(self._background)} 字）")
+        else:
+            logger.info("无背景故事总结，跳过（可运行 background_compiler 生成）")
 
     def render_system_prompt(self, summary: str = "") -> str:
         """渲染系统提示词。早期对话摘要拼到末尾。"""
@@ -181,6 +195,7 @@ class PersonaRenderer:
             catchphrases="、".join(str(x) for x in p.catchphrases),
             style=p.style,
             forbidden="、".join(str(x) for x in p.forbidden),
+            background=self._background if self._background else "（无）",
         )
         if summary:
             prompt += f"\n\n# 早期对话摘要（你之前看过的消息和回复的要点）\n{summary}"
