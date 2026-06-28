@@ -146,13 +146,6 @@ class NapCatClient:
             "title": title,
         })
 
-    def set_msg_emoji_like(self, message_id: str, emoji_id: str) -> dict:
-        """对消息做 emoji 反应。"""
-        return self._call("set_msg_emoji_like", {
-            "message_id": message_id,
-            "emoji_id": emoji_id,
-        })
-
     def fetch_ptt_text(self, message_id: str, quiet: bool = False) -> str:
         """获取语音转文字结果（/fetch_ptt_text）。
 
