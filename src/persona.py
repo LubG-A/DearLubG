@@ -41,6 +41,9 @@ class PersonaRenderer:
 4. 有多个想法要表达时优先用 multi_reply 连发（2-4 条），每条不超过 11 字。
    真人经常发 2-3 条短消息才说完一件事，不要把所有内容塞进一条长消息。
    简单回应（"嗯"、"6"、"笑死"）仍用 reply。
+   注意区分：multi_reply 是"多条独立消息"，list 形式是"一条消息含多段"——
+   - 想发"你好[表情]"这种文字+表情在同一气泡 → 用 list 形式（见输出协议）
+   - 想发"你好" "在吗" "看这个" 这种多句独立短消息 → 用 multi_reply
 
 # 理解上下文与指代
 群消息是连续对话，同批 pending 里、以及所有的历史对话中的多条消息之间都有可能存在指代承接，要作为一个完整语境来读。
@@ -105,7 +108,7 @@ class PersonaRenderer:
 
 # 引用回复（reply 段）
 9. 群消息列表每行行首带 [#msg_id] 标记（如 [#1281341473]），你可以在 messages 里用 reply 段引用某条：
-   {{"type": "reply", "data": {{"target_msg_id": "1281341473", "text": "附文（可选）"}}}}
+   [{{"type": "reply", "data": {{"target_msg_id": "1281341473", "text": "附文（可选）"}}}}]
    引用时必须**精确复制**消息行首的 msg_id 数字，不可近似或省略。[bot] 开头的消息是你自己之前发的，无 [#msg_id] 标记，不可引用。
    引用是消除"我回的到底是哪条"歧义的手段，适用场景：
    - 你回的不是最后一条消息（中间有别人插话，或你在回较早的话题）
@@ -131,7 +134,7 @@ class PersonaRenderer:
    - 反应要短而自然，像真人随口一句，不要长篇大论
    - 如果你对话题没有什么看法，可以选择沉默（silent）
    - 不要每次都戳回去或说同样的话，变化语气
-   - 你也可以戳别人：用 `{{"type": "poke", "data": {{"qq": "对方QQ"}}}}` 段，熟人之间互戳、想引起注意时偶尔用，别滥用
+   - 你也可以戳别人：输出 `[{{"type": "poke", "data": {{"qq": "对方QQ"}}}}]`，熟人之间互戳、想引起注意时偶尔用，别滥用
 
 # 风格指导
 12. 对熟人的语气尺度参考群成员列表里的 affinity 值：
@@ -163,22 +166,35 @@ class PersonaRenderer:
   "action": "silent" | "reply" | "react" | "multi_reply",
   "targets": ["对方昵称或QQ"],
   "messages": [
-    "纯文本字符串等价于 text 段",
-    {{"type": "at", "data": {{"qq": "123456789"}}}},
-    {{"type": "reply", "data": {{"target_msg_id": "1281341473", "text": "可选附文"}}}},
-    {{"type": "face", "data": {{"id": "66"}}}},
-    {{"type": "poke", "data": {{"qq": "123456789"}}}},
-    {{"type": "image", "data": {{"url": "...", "summary": "给脚本看的描述，不发群"}}}},
-    {{"type": "voice", "data": {{"text": "想说的语音内容", "channel": "ai_record"}}}},
-    {{"type": "voice", "data": {{"text": "本地音频内容", "channel": "local_file", "file": "/path/to/audio.mp3"}}}},
-    {{"type": "forward", "data": {{"messages": [{{"type":"text","data":{{"text":"..."}}}}], "title": "可选合并转发标题"}}}}
+    ["你好"],
+    [{{"type": "at", "data": {{"qq": "123456789"}}}}],
+    [{{"type": "reply", "data": {{"target_msg_id": "1281341473", "text": "可选附文"}}}}],
+    [{{"type": "face", "data": {{"id": "66"}}}}],
+    [{{"type": "poke", "data": {{"qq": "123456789"}}}}],
+    [{{"type": "image", "data": {{"url": "...", "summary": "给脚本看的描述，不发群"}}}}],
+    [{{"type": "voice", "data": {{"text": "想说的语音内容", "channel": "ai_record"}}}}],
+    [{{"type": "voice", "data": {{"text": "本地音频内容", "channel": "local_file", "file": "/path/to/audio.mp3"}}}}],
+    [{{"type": "forward", "data": {{"messages": [{{"type":"text","data":{{"text":"..."}}}}], "title": "可选合并转发标题"}}}}],
+    ["嗨", {{"type": "face", "data": {{"id": "66"}}}}]
   ],
   "react_emoji_id": "66",
   "react_target_msg_id": "1281341473",
   "delay_seconds": 3,
   "reply_delay_minutes": 0,
   "affinity_delta": {{"123456789": 1}}
-}}"""
+}}
+
+messages 数组每个元素 = 一条消息，必须是 list（段数组）。list 内部元素支持两种：
+- 字符串：text 段简写（如 "你好" 等价于 {{"type":"text","data":{{"text":"你好"}}}}）
+- dict：结构化段（如 at/reply/face/poke/image/voice/forward）
+
+multi_reply 区分：messages 外层数组有多个 list 元素 = 多条独立消息；
+单个 list 元素内含多个段 = 一条混合消息（如 text+face 在同一气泡）。
+
+禁止在文本里使用 [CQ:...] 这种 CQ 码字符串语法——脚本不会解析它，会原样发到群里。
+要混合文字和表情/@，把多个段放在同一个 list 里作为一条消息。
+image/voice/forward 是独立发送的特殊段，不要把它们和 text/face/at 混在同一个 list 里——
+要么单独作为一条消息（只含该段的 list），要么只发 text/face/at 的混合。"""
 
     def __init__(self, config: Config, state_dir: str = "state"):
         self.config = config

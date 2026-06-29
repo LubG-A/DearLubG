@@ -647,6 +647,9 @@ def _msg_to_text(msg) -> str:
     """消息转文本摘要（写回历史用）。"""
     if isinstance(msg, str):
         return msg
+    if isinstance(msg, list):
+        # 多段混合消息：逐段拼接摘要
+        return "".join(_msg_to_text(seg) for seg in msg)
     if isinstance(msg, dict):
         t = msg.get("type", "")
         d = msg.get("data", {})

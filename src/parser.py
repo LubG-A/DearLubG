@@ -80,32 +80,36 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
         messages = []
 
     # 消息段 type 校验
+    # messages 数组每个元素 = 一条消息，支持三种形式：
+    #   - str：纯文本简写，等价于 [{"type":"text","data":{"text":...}}]
+    #   - dict：单段消息简写，等价于 [seg]
+    #   - list：多段混合消息（如 text+face 一条发出），元素为 dict 段
     cleaned_messages = []
     for msg in messages:
         if isinstance(msg, str):
             cleaned_messages.append(msg)
             continue
+        if isinstance(msg, list):
+            # list 形式：一条消息含多段（混合消息）
+            # list 内部元素支持 string（text 简写）和 dict（结构化段）
+            segs = []
+            for seg in msg:
+                if isinstance(seg, str):
+                    seg = {"type": "text", "data": {"text": seg}}
+                cleaned_seg = _validate_segment(seg)
+                if cleaned_seg is not None:
+                    segs.append(cleaned_seg)
+            if segs:
+                cleaned_messages.append(segs)
+            else:
+                logger.warning(f"混合消息所有段无效，丢弃: {msg}")
+            continue
         if not isinstance(msg, dict):
-            logger.warning(f"消息段非 dict，丢弃: {msg}")
+            logger.warning(f"消息非 str/dict/list，丢弃: {msg}")
             continue
-        msg_type = msg.get("type", "")
-        if msg_type not in VALID_MSG_TYPES:
-            logger.warning(f"未知消息段 type={msg_type}，丢弃")
-            continue
-        # reply 段：校验 target_msg_id（非空 str，由 sender 配合 history 透传给 NapCat 校验）
-        if msg_type == "reply":
-            data_dict = msg.get("data", {})
-            if not isinstance(data_dict, dict):
-                data_dict = {}
-            target_id = data_dict.get("target_msg_id", "")
-            if not isinstance(target_id, str):
-                target_id = str(target_id) if target_id else ""
-            if not target_id:
-                logger.warning(f"reply 段 target_msg_id 为空，丢弃 reply 段")
-                continue  # 无效的 reply 段直接丢弃
-            data_dict["target_msg_id"] = target_id
-            msg["data"] = data_dict
-        cleaned_messages.append(msg)
+        cleaned_seg = _validate_segment(msg)
+        if cleaned_seg is not None:
+            cleaned_messages.append(cleaned_seg)
 
     # affinity_delta 校验
     affinity_delta = data.get("affinity_delta", {})
@@ -154,3 +158,35 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
         affinity_delta=cleaned_delta,
         reply_delay_minutes=final_reply_delay,
     )
+
+
+def _validate_segment(seg) -> Optional[dict]:
+    """校验单个消息段（dict 形式）。
+
+    Args:
+        seg: 待校验的段，应为 dict
+
+    Returns:
+        校验通过的段 dict，或 None（无效段丢弃）
+    """
+    if not isinstance(seg, dict):
+        logger.warning(f"消息段非 dict，丢弃: {seg}")
+        return None
+    msg_type = seg.get("type", "")
+    if msg_type not in VALID_MSG_TYPES:
+        logger.warning(f"未知消息段 type={msg_type}，丢弃")
+        return None
+    # reply 段：校验 target_msg_id（非空 str，由 sender 配合 history 透传给 NapCat 校验）
+    if msg_type == "reply":
+        data_dict = seg.get("data", {})
+        if not isinstance(data_dict, dict):
+            data_dict = {}
+        target_id = data_dict.get("target_msg_id", "")
+        if not isinstance(target_id, str):
+            target_id = str(target_id) if target_id else ""
+        if not target_id:
+            logger.warning("reply 段 target_msg_id 为空，丢弃 reply 段")
+            return None
+        data_dict["target_msg_id"] = target_id
+        seg["data"] = data_dict
+    return seg

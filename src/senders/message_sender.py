@@ -26,7 +26,10 @@ class NapCatMessageSender:
         每条消息转换为一段数组（可能含多段），返回多条消息的段数组列表。
 
         Args:
-            messages: 模型输出的 messages 列表（字符串或 dict）
+            messages: 模型输出的 messages 列表，元素支持三种形式：
+                      - str：纯文本简写（单 text 段）
+                      - dict：单段消息简写
+                      - list：多段混合消息（一条消息含多段，如 text+face）
             history: 历史记录管理器（用于 reply 段校验 target_msg_id）
 
         Returns:
@@ -40,9 +43,23 @@ class NapCatMessageSender:
         return result
 
     def _build_one(self, msg, history) -> list[dict]:
-        """转换单条消息为段数组。"""
+        """转换单条消息为段数组。
+
+        支持三种输入：
+        - str：等价于 [{"type":"text","data":{"text":msg}}]
+        - dict：单段消息，按 type 分发
+        - list：多段混合消息，逐段转换后拼接（保持顺序）
+        """
         if isinstance(msg, str):
             return [{"type": "text", "data": {"text": msg}}]
+
+        if isinstance(msg, list):
+            # 多段混合消息：逐段转换并拼接
+            segs = []
+            for seg in msg:
+                built = self._build_one(seg, history)
+                segs.extend(built)
+            return segs
 
         if not isinstance(msg, dict):
             return []
