@@ -11,7 +11,7 @@
 - LLM 工作线程用 _cycle_running 标志保证串行，LLM 调用和发送不持锁
 - _cycle_lock 只保护"检查+设置 _cycle_running"（持锁极短），不覆盖 LLM 调用
 - 撞 cycle 时注册 _cycle_pending，cycle 完成后立即重跑（不等静默窗口 20 秒）
-- 静默窗口定时器：每条新消息重置，20s 无新消息则触发兜底 LLM 调用
+- 静默窗口定时器：每条新消息重置，150s 无新消息则触发兜底 LLM 调用
 """
 import time
 import random
@@ -37,7 +37,7 @@ from src.utils.logger import get_logger
 logger = get_logger("main")
 
 # 冷却配置
-HARD_COOLDOWN_SECONDS = 5       # 硬因子（@/提问）触发冷却，距上次回复 <2s 推迟
+HARD_COOLDOWN_SECONDS = 5       # 硬因子（@/提问）触发冷却，距上次回复 <5s 推迟
 SOFT_COOLDOWN_MIN = 10         # 软因子触发冷却下限
 SOFT_COOLDOWN_MAX = 60         # 软因子触发冷却上限
 QUIET_WINDOW_SECONDS = 150       # 静默窗口：N 秒无新消息后兜底触发

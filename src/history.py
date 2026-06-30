@@ -142,7 +142,7 @@ class HistoryManager:
 
         伪消息格式与普通群消息一致，nickname="系统"，content 标注被撤回的 msg_id。
         msg_id 为空（不可引用，build_user_content 不加 [#] 前缀），is_bot=False（让 LLM 看到这条通知）。
-        LLM 通过 content 文本"msg_id=xxx 的消息被撤回"识别撤回事件（persona 规则 8.5 引导）。
+        LLM 通过 content 文本"msg_id=xxx 的消息被撤回"识别撤回事件（persona 规则 10 引导）。
         下一轮 drain 时进入 pending。
 
         线程安全：持 _buffer_lock，与 drain 操作不冲突。
