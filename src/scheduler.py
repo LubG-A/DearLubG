@@ -1,10 +1,7 @@
-"""主动触发调度器。
+"""主动触发调度器（阶段 D：per-group 实例，移入 GroupContext）。
 
-两种定时器：
-1. 主动触发定时器：群冷清时随机间隔（120-360 分钟）唤醒，让 LLM 自主决定要不要主动开口
-2. 延迟回复检查：由被动触发流程带动，不在此处实现
-
-深夜（23:00-3:00）禁用主动触发，但被动触发正常工作。
+每群持有一个 ActiveScheduler 实例，独立 Timer，独立状态文件（state/{group_id}/scheduler.json）。
+间隔沿用原有随机 min-max 逻辑，深夜（23:00-3:00）禁用主动触发。
 
 状态持久化：跨重启保留 last_active_check_time 和 next_active_check_time。
 """
@@ -23,12 +20,13 @@ logger = get_logger("scheduler")
 
 
 class ActiveScheduler:
-    """主动触发调度器。"""
+    """per-group 主动触发调度器。"""
 
-    def __init__(self, config: Config, state_dir: str = "state"):
+    def __init__(self, config: Config, group_id: str, state_dir: str = "state"):
         self.config = config
+        self.group_id = group_id
         self.state_dir = Path(state_dir)
-        self.state_dir.mkdir(exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.state_dir / "scheduler.json"
 
         # 状态
@@ -39,8 +37,8 @@ class ActiveScheduler:
         self._timer: Optional[threading.Timer] = None
         self._stop_event = threading.Event()
 
-        # 回调（主动触发时调用，让 main.py 执行 LLM 调用）
-        self._callback: Optional[Callable[[], None]] = None
+        # 回调（主动触发时调用，签名 (group_id) -> None）
+        self._callback: Optional[Callable[[str], None]] = None
 
         self._load()
 
@@ -114,7 +112,7 @@ class ActiveScheduler:
             # 已过期，立即触发（加小延迟避免密集调用）
             wait_seconds = 5
 
-        logger.info(f"下次主动触发：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}（{wait_seconds/60:.1f} 分钟后）")
+        logger.info(f"群 {self.group_id} 下次主动触发：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}（{wait_seconds/60:.1f} 分钟后）")
 
         # 取消旧定时器
         if self._timer:
@@ -140,42 +138,44 @@ class ActiveScheduler:
             in_night = cfg.night_end_hour <= hour < cfg.night_start_hour
 
         if in_night:
-            logger.info("当前为深夜，跳过本次主动触发，重新调度")
+            logger.info(f"群 {self.group_id} 当前为深夜，跳过本次主动触发，重新调度")
             self._schedule_next()
             return
 
-        logger.info("主动触发定时器到期，执行回调")
+        logger.info(f"群 {self.group_id} 主动触发定时器到期，执行回调")
         self.last_active_check_time = now
         self._save()
 
         try:
             if self._callback:
-                self._callback()
+                self._callback(self.group_id)
         except Exception as e:
-            logger.error(f"主动触发回调异常: {e}", exc_info=True)
+            logger.error(f"群 {self.group_id} 主动触发回调异常: {e}", exc_info=True)
         finally:
             # 安排下一次
             self._schedule_next()
 
     # ---------- 公共接口 ----------
-    def start(self, callback: Callable[[], None]):
+    def start(self, callback: Callable[[str], None], group_id: str):
         """启动调度器。
 
         Args:
-            callback: 主动触发时调用的回调（通常是 main.py 的主动 LLM 调用）
+            callback: 主动触发时调用的回调，签名 (group_id) -> None
+            group_id: 本调度器所属的群 ID
         """
         self._callback = callback
+        self.group_id = group_id
         self._stop_event.clear()
 
         # 如果有保存的 next_active_check_time 且未过期，按原计划
         # 否则生成新的
         now = datetime.now()
         if self.next_active_check_time and self.next_active_check_time > now:
-            logger.info(f"恢复调度器计划：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"群 {self.group_id} 恢复调度器计划：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
             self.next_active_check_time = self._generate_next_check_time()
             self._save()
-            logger.info(f"生成新调度计划：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"群 {self.group_id} 生成新调度计划：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         wait_seconds = (self.next_active_check_time - now).total_seconds()
         if wait_seconds <= 0:
@@ -191,7 +191,7 @@ class ActiveScheduler:
         if self._timer:
             self._timer.cancel()
             self._timer = None
-        logger.info("调度器已停止")
+        logger.info(f"群 {self.group_id} 调度器已停止")
 
     def is_active_check_time(self) -> bool:
         """当前是否为主动触发状态（供 main.py 判断）。"""

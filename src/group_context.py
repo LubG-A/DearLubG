@@ -4,6 +4,7 @@
 - conversation history（messages, pending, fast_buffer, delayed_replies）
 - attribution（dynamic_weight 按群独立）
 - trigger_evaluator（使用本群 history + 全局 affinity）
+- active_scheduler（本群主动触发调度器，阶段 D）
 - last_reply_time（本群冷却计时）
 - quiet_timer（本群静默窗口）
 - cycle_pending（本群撞 cycle 重试标志）
@@ -12,6 +13,7 @@
 
 阶段 A：纯结构抽取，单群运行，零行为变化。
 阶段 B：per-group 子目录 state/{group_id}/，多群独立文件存储。
+阶段 D：主动触发调度器移入本类，每群独立倒计时。
 """
 import threading
 from typing import Optional
@@ -23,6 +25,7 @@ from .trigger import TriggerEvaluator
 from .affinity import AffinityManager
 from .napcat_client import NapCatClient
 from .llm_client import LLMClient
+from .scheduler import ActiveScheduler
 
 
 class GroupContext:
@@ -59,6 +62,10 @@ class GroupContext:
         self.trigger_evaluator = TriggerEvaluator(
             config, self.history, self_qq, persona_name,
             affinity_manager=affinity,
+        )
+        # 阶段 D：per-group 主动触发调度器（从全局单例移入）
+        self.active_scheduler = ActiveScheduler(
+            config, group_id=group_id, state_dir=per_group_state_dir,
         )
 
         # per-group 运行时状态

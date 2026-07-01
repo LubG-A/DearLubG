@@ -58,7 +58,7 @@ trigger_hard_factors:
 
 # 主动触发（让 bot 像真人一样有时会主动开口）
 active_trigger:
-  enabled: false                 # 阶段 B 关闭，阶段 D 每群独立倒计时后开启
+  enabled: true                  # 阶段 D：每群独立倒计时
   min_interval_minutes: 60        # 主动触发最小间隔（分钟）
   max_interval_minutes: 420        # 主动触发最大间隔（分钟）
   night_start_hour: 23             # 深夜起始小时（此区间内禁用主动触发）

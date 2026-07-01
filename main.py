@@ -37,7 +37,6 @@ from src.affinity import AffinityManager
 from src.impression import CrossGroupImpressionStore, IMPRESSION_SNAPSHOT_TURNS
 from src.persona import PersonaRenderer
 from src.parser import parse_and_validate
-from src.scheduler import ActiveScheduler
 from src.senders.message_sender import NapCatMessageSender
 from src.senders.voice_sender import AIRecordVoiceSender, LocalFileVoiceSender
 from src.senders.image_sender import EmptyImageSender
@@ -60,13 +59,13 @@ class Bot:
     def __init__(self, config_path: str = "config.yaml"):
         self.config = load_config(config_path)
 
-        # 全局共享单例（napcat / llm / affinity / persona / scheduler / senders）
+        # 全局共享单例（napcat / llm / affinity / persona / senders）
+        # 阶段 D：active_scheduler 移入 GroupContext（per-group 独立倒计时）
         self.napcat = NapCatClient(self.config.napcat.base_url, self.config.napcat.group_ids)
         self.llm = LLMClient(self.config)
         self.affinity = AffinityManager()  # 全局按 QQ（跨群身份一致）
         self.impression_board = CrossGroupImpressionStore()  # 跨群印记板（阶段 C）
         self.persona_renderer = PersonaRenderer(self.config)
-        self.scheduler = ActiveScheduler(self.config)  # 阶段 D 移入 GroupContext
 
         # Sender 实现（全局共享）
         self.message_sender = NapCatMessageSender(self.napcat)
@@ -120,6 +119,18 @@ class Bot:
         logger.info(f"预热完成，机器人 {self.self_nickname}({self.self_qq})，"
                     f"群 {list(self.groups.keys())}")
         logger.info(f"跨群印记板：{len(self.impression_board.impressions)} 个群有印记")
+
+        # 阶段 D：为每群启动主动触发调度器（per-group 独立倒计时）
+        if self.config.active_trigger and self.config.active_trigger.enabled:
+            for gid, ctx in self.groups.items():
+                ctx.active_scheduler.start(self.on_active_trigger, gid)
+            logger.info(f"主动触发调度器已启动：{len(self.groups)} 个群，"
+                        f"间隔 {self.config.active_trigger.min_interval_minutes}-"
+                        f"{self.config.active_trigger.max_interval_minutes} 分钟随机，"
+                        f"深夜 {self.config.active_trigger.night_start_hour}:00-"
+                        f"{self.config.active_trigger.night_end_hour}:00 禁用")
+        else:
+            logger.info("主动触发调度器已禁用")
 
     def _probe_ai_voice_character(self):
         """探测配置的 AI 语音 character 是否在可用列表中。
@@ -439,22 +450,20 @@ class Bot:
         except Exception as e:
             logger.error(f"静默窗口兜底触发异常: {e}", exc_info=True)
 
-    def on_active_trigger(self):
-        """主动触发回调（由调度器调用）。
+    def on_active_trigger(self, group_id: str):
+        """主动触发回调（由 per-group 调度器调用）。
 
-        阶段 B：主动触发已关闭（config.active_trigger.enabled: false），本方法不被调用。
-        代码保留正确引用，阶段 D 改为每群独立倒计时后开启。
+        阶段 D：每群独立调度器触发，传入对应 group_id。
         """
         try:
-            logger.info("主动触发：执行 LLM 调用")
-            group_id = self.config.napcat.group_ids[0]  # 阶段 B 仅引用第一个群，阶段 D 改为每群独立
+            logger.info(f"群 {group_id} 主动触发：执行 LLM 调用")
             ctx = self.groups.get(group_id)
             if ctx is None:
                 logger.warning(f"主动触发但未找到群 {group_id} 的上下文")
                 return
 
             if not self._try_enter_cycle(ctx):
-                logger.debug("主动触发但 cycle 在跑，已入队等待")
+                logger.debug(f"群 {group_id} 主动触发但 cycle 在跑，已入队等待")
                 return
 
             try:
@@ -463,7 +472,7 @@ class Bot:
                 self._exit_cycle()
                 self._drain_cycle_queue()
         except Exception as e:
-            logger.error(f"主动触发异常: {e}", exc_info=True)
+            logger.error(f"群 {group_id} 主动触发异常: {e}", exc_info=True)
 
     def _run_llm_cycle(self, ctx: GroupContext, soft_factors, is_active: bool):
         """LLM 工作循环（B2 方案：调用方已通过 _try_enter_cycle 获取运行权）。
@@ -704,21 +713,12 @@ class Bot:
 
     def run(self, webhook_host: str = "0.0.0.0", webhook_port: int = 8081):
         """启动机器人。"""
-        self.warmup()
+        self.warmup()   # 阶段 D：per-group 调度器在 warmup 中启动
         server = NapCatWebhookServer(
             webhook_host, webhook_port, self.on_group_message,
             on_recall=self.on_group_recall,
             on_poke=self.on_group_poke,
         )
-        # 启动主动触发调度器
-        if self.config.active_trigger and self.config.active_trigger.enabled:
-            self.scheduler.start(self.on_active_trigger)
-            logger.info(f"主动触发调度器已启动：{self.config.active_trigger.min_interval_minutes}-"
-                        f"{self.config.active_trigger.max_interval_minutes} 分钟随机，"
-                        f"深夜 {self.config.active_trigger.night_start_hour}:00-"
-                        f"{self.config.active_trigger.night_end_hour}:00 禁用")
-        else:
-            logger.info("主动触发调度器已禁用")
         logger.info(f"机器人启动，监听群 {list(self.groups.keys())}")
         server.start()
 
