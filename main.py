@@ -16,10 +16,18 @@
 阶段 A 重构：per-group 状态移入 GroupContext（src/group_context.py），
 Bot 持有 self.groups: dict[str, GroupContext]，方法通过 ctx 参数访问 per-group 状态。
 全局共享单例（napcat/llm/affinity/persona/senders）仍留在 Bot。
+
+阶段 B：多群配置（config.group_ids）+ 全局 cycle 队列。
+- NapCatClient 方法接受 group_id 参数，member_cache 嵌套化 {group_id: {qq: info}}
+- webhook 去掉单群过滤，按 group_id 路由到对应 ctx
+- per-group 文件存储：state/{group_id}/ 子目录
+- _cycle_queue + _cycle_queue_set：cycle 结束后处理其他撞 cycle 的群
+- 主动触发关闭（阶段 D 每群独立倒计时后开启）
 """
 import time
 import random
 import threading
+from collections import deque
 from typing import Optional
 
 from src.config import load_config
@@ -52,8 +60,7 @@ class Bot:
         self.config = load_config(config_path)
 
         # 全局共享单例（napcat / llm / affinity / persona / scheduler / senders）
-        # 注：napcat 在阶段 B 才会改为支持多群（方法接受 group_id 参数），当前仍单群
-        self.napcat = NapCatClient(self.config.napcat.base_url, self.config.napcat.group_id)
+        self.napcat = NapCatClient(self.config.napcat.base_url, self.config.napcat.group_ids)
         self.llm = LLMClient(self.config)
         self.affinity = AffinityManager()  # 全局按 QQ（跨群身份一致）
         self.persona_renderer = PersonaRenderer(self.config)
@@ -78,6 +85,9 @@ class Bot:
         # _cycle_pending 已移入 GroupContext（per-group，多群下各群独立重试标志）
         self._cycle_lock = threading.Lock()
         self._cycle_running: bool = False
+        # 全局 cycle 队列：cycle 结束后处理其他撞 cycle 的群（阶段 B）
+        self._cycle_queue: deque[str] = deque()
+        self._cycle_queue_set: set[str] = set()
 
         # per-group 上下文表：{group_id -> GroupContext}
         # 阶段 A 单群，warmup 时填充一个 GroupContext
@@ -90,23 +100,23 @@ class Bot:
         self.self_qq = str(self.napcat.self_info.get("user_id", ""))
         self.self_nickname = self.napcat.self_info.get("nickname", "")
 
-        # 为 config 中的 group_id 创建 GroupContext
-        # 阶段 A 单群，阶段 B 起为每个配置的 group_id 各创建一个
-        group_id = self.config.napcat.group_id
-        ctx = GroupContext(
-            group_id=group_id,
-            config=self.config,
-            napcat=self.napcat,
-            llm=self.llm,
-            affinity=self.affinity,
-            self_qq=self.self_qq,
-            persona_name=self.config.persona.name,
-        )
-        self.groups[group_id] = ctx
+        # 为每个配置的 group_id 创建 GroupContext
+        for group_id in self.config.napcat.group_ids:
+            ctx = GroupContext(
+                group_id=group_id,
+                config=self.config,
+                napcat=self.napcat,
+                llm=self.llm,
+                affinity=self.affinity,
+                self_qq=self.self_qq,
+                persona_name=self.config.persona.name,
+            )
+            self.groups[group_id] = ctx
 
         # 探测 AI 语音 character 是否可用（不阻塞启动）
         self._probe_ai_voice_character()
-        logger.info(f"预热完成，机器人 {self.self_nickname}({self.self_qq})，群 {group_id}")
+        logger.info(f"预热完成，机器人 {self.self_nickname}({self.self_qq})，"
+                    f"群 {list(self.groups.keys())}")
 
     def _probe_ai_voice_character(self):
         """探测配置的 AI 语音 character 是否在可用列表中。
@@ -114,8 +124,9 @@ class Bot:
         失败不阻塞启动，仅记 WARNING（语音调用时会触发 fallback_to_text）。
         """
         character = self.config.voice.ai_record_character
+        group_id = self.config.napcat.group_ids[0]  # 用第一个群探测
         try:
-            characters = self.napcat.get_ai_characters()
+            characters = self.napcat.get_ai_characters(group_id)
             if not characters:
                 logger.warning("无法获取 AI 语音角色列表（可能 NapCat 版本不支持），跳过 character 探测")
                 return
@@ -145,9 +156,6 @@ class Bot:
             if not recalled_msg_id:
                 logger.warning(f"撤回通知缺少 message_id: {data}")
                 return
-            # 群过滤（webhook 已过滤，这里防御性再检查）
-            if self.config.napcat.group_id and group_id != self.config.napcat.group_id:
-                return
 
             ctx = self.groups.get(group_id)
             if ctx is None:
@@ -169,9 +177,6 @@ class Bot:
             target_id = str(data.get("target_id", ""))
             poker_id = str(data.get("user_id", ""))
             group_id = str(data.get("group_id", ""))
-            # 群过滤
-            if self.config.napcat.group_id and group_id != self.config.napcat.group_id:
-                return
             # 只处理戳自己（别人被戳不处理，避免噪音）
             if target_id != self.self_qq:
                 logger.debug(f"忽略非戳自己的 poke: target={target_id} poker={poker_id}")
@@ -181,7 +186,7 @@ class Bot:
             if ctx is None:
                 return
 
-            poker_nick = self.napcat.get_nickname(poker_id)
+            poker_nick = self.napcat.get_nickname(group_id, poker_id)
             logger.info(f"收到戳一戳: poker={poker_nick}({poker_id})")
             # 追加伪消息到 fast_buffer
             ctx.history.append_poke_notice(poker_id, poker_nick)
@@ -205,19 +210,15 @@ class Bot:
         5. 无论如何重置静默定时器（每条新消息都推迟兜底触发）
         """
         try:
-            # 防御性群过滤（阶段 A 仍保留单群过滤，阶段 B 去掉改为路由）
             msg_group_id = str(msg.get("group_id", ""))
-            if msg_group_id and msg_group_id != self.config.napcat.group_id:
-                logger.debug(f"on_group_message 丢弃非目标群消息：{msg_group_id}")
-                return
 
             ctx = self.groups.get(msg_group_id)
             if ctx is None:
-                logger.warning(f"未找到群 {msg_group_id} 的上下文，丢弃消息")
+                logger.debug(f"未找到群 {msg_group_id} 的上下文，丢弃消息")
                 return
 
             sender_qq = str(msg.get("user_id", ""))
-            sender_nick = self.napcat.get_nickname(sender_qq)
+            sender_nick = self.napcat.get_nickname(msg_group_id, sender_qq)
             content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
             msg_id = str(msg.get("message_id", ""))
 
@@ -308,14 +309,48 @@ class Bot:
         with self._cycle_lock:
             if self._cycle_running:
                 ctx._cycle_pending = True
+                self._enqueue_group(ctx.group_id)
                 return False
             self._cycle_running = True
             return True
+
+    def _enqueue_group(self, group_id: str):
+        """群入队 cycle 队列（去重）。在 _cycle_lock 保护下调用。"""
+        if group_id not in self._cycle_queue_set:
+            self._cycle_queue.append(group_id)
+            self._cycle_queue_set.add(group_id)
 
     def _exit_cycle(self):
         """退出 LLM cycle，清除运行标志。"""
         with self._cycle_lock:
             self._cycle_running = False
+
+    def _drain_cycle_queue(self):
+        """处理 cycle 队列：cycle 结束后处理其他撞 cycle 的群。
+
+        迭代处理（非递归），避免多群排队时递归过深。
+        每次从队首取一个群，执行 _run_llm_cycle，结束后继续取下一个。
+        """
+        while self._cycle_queue:
+            group_id = self._cycle_queue.popleft()
+            self._cycle_queue_set.discard(group_id)
+            ctx = self.groups.get(group_id)
+            if ctx is None or not ctx._cycle_pending:
+                continue  # 已被消费或不存在
+
+            with self._cycle_lock:
+                if self._cycle_running:
+                    # 不应该发生（_cycle_running 刚清），防御性重新入队
+                    self._cycle_queue.appendleft(group_id)
+                    self._cycle_queue_set.add(group_id)
+                    return
+                self._cycle_running = True
+
+            try:
+                logger.debug(f"从队列处理群 {group_id} 的 pending cycle")
+                self._run_llm_cycle(ctx, soft_factors=None, is_active=False)
+            finally:
+                self._exit_cycle()
 
     def _consume_pending_trigger(self, ctx: GroupContext) -> bool:
         """检查并消费重试标志（_run_llm_cycle while 循环末尾调用）。
@@ -351,14 +386,14 @@ class Bot:
             return
 
         if not self._try_enter_cycle(ctx):
-            ctx._cycle_pending = True
-            logger.debug(f"{trigger_label}触发但 cycle 在跑，已注册 ctx._cycle_pending（cycle 完成后按回复/silent 分别处理）")
+            logger.debug(f"{trigger_label}触发但 cycle 在跑，已入队等待")
             return
 
         try:
             self._run_llm_cycle(ctx, soft_factors=soft_factors, is_active=False)
         finally:
             self._exit_cycle()
+            self._drain_cycle_queue()
 
     def _reschedule_quiet_trigger(self, ctx: GroupContext, delay: float = QUIET_WINDOW_SECONDS):
         """重置静默窗口定时器：N 秒后若仍无新消息则兜底触发。
@@ -390,44 +425,40 @@ class Bot:
                 return
 
             if not self._try_enter_cycle(ctx):
-                ctx._cycle_pending = True
-                logger.debug("静默窗口到期但 cycle 在跑，已注册完成后重试")
+                logger.debug("静默窗口到期但 cycle 在跑，已入队等待")
                 return
 
             try:
                 self._run_llm_cycle(ctx, soft_factors=None, is_active=False)
             finally:
                 self._exit_cycle()
+                self._drain_cycle_queue()
         except Exception as e:
             logger.error(f"静默窗口兜底触发异常: {e}", exc_info=True)
 
     def on_active_trigger(self):
         """主动触发回调（由调度器调用）。
 
-        cycle 串行检查：撞 _cycle_running 则注册重试（重跑时 is_active 丢失，
-        语义上等同于"群里正在活跃对话，不需要主动开口"）。
-
-        阶段 A：单群，直接取 config.napcat.group_id 找 ctx。
-        阶段 D：scheduler 移入 GroupContext，每群独立倒计时，本方法不再需要硬编码 group_id。
+        阶段 B：主动触发已关闭（config.active_trigger.enabled: false），本方法不被调用。
+        代码保留正确引用，阶段 D 改为每群独立倒计时后开启。
         """
         try:
             logger.info("主动触发：执行 LLM 调用")
-            # 阶段 A：单群，直接取 config 的 group_id
-            group_id = self.config.napcat.group_id
+            group_id = self.config.napcat.group_ids[0]  # 阶段 B 仅引用第一个群，阶段 D 改为每群独立
             ctx = self.groups.get(group_id)
             if ctx is None:
                 logger.warning(f"主动触发但未找到群 {group_id} 的上下文")
                 return
 
             if not self._try_enter_cycle(ctx):
-                ctx._cycle_pending = True
-                logger.debug("主动触发但 cycle 在跑，已注册完成后重试")
+                logger.debug("主动触发但 cycle 在跑，已入队等待")
                 return
 
             try:
                 self._run_llm_cycle(ctx, soft_factors=None, is_active=True)
             finally:
                 self._exit_cycle()
+                self._drain_cycle_queue()
         except Exception as e:
             logger.error(f"主动触发异常: {e}", exc_info=True)
 
@@ -586,7 +617,7 @@ class Bot:
             for seg in segs:
                 if seg.get("type") == "forward":
                     data = seg.get("data", {})
-                    self.napcat.send_group_forward_msg(data.get("messages", []), data.get("title", ""))
+                    self.napcat.send_group_forward_msg(ctx.group_id, data.get("messages", []), data.get("title", ""))
                     handled = True
                     break
                 if seg.get("type") == "image":
@@ -640,12 +671,11 @@ class Bot:
         - 最近 N 轮发言过的成员（recent_speakers，从 ctx.history 派生）
         - 有亲密度记录的成员（affinity > 0，全局共享）
         - 自己（self）
-
-        注：napcat.member_cache 当前是全局扁平结构（阶段 A 单群），阶段 B 起嵌套化。
         """
         recent_speakers = ctx.history.get_recent_speakers()
+        group_members = self.napcat.member_cache.get(ctx.group_id, {})
         result = []
-        for qq, info in self.napcat.member_cache.items():
+        for qq, info in group_members.items():
             affinity = self.affinity.get(qq)
             # 过滤：近期发言过 / 有亲密度 / 是自己
             if qq not in recent_speakers and affinity <= 0 and qq != self.self_qq:
@@ -663,7 +693,6 @@ class Bot:
         self.warmup()
         server = NapCatWebhookServer(
             webhook_host, webhook_port, self.on_group_message,
-            target_group_id=self.config.napcat.group_id,
             on_recall=self.on_group_recall,
             on_poke=self.on_group_poke,
         )
@@ -676,7 +705,7 @@ class Bot:
                         f"{self.config.active_trigger.night_end_hour}:00 禁用")
         else:
             logger.info("主动触发调度器已禁用")
-        logger.info(f"机器人启动（仅监听群 {self.config.napcat.group_id}）")
+        logger.info(f"机器人启动，监听群 {list(self.groups.keys())}")
         server.start()
 
 

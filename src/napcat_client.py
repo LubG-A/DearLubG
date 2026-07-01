@@ -16,34 +16,36 @@ logger = get_logger("napcat_client")
 
 
 class NapCatClient:
-    """NapCat HTTP API 客户端。"""
+    """NapCat HTTP API 客户端（多群支持）。"""
 
-    def __init__(self, base_url: str, group_id: str):
+    def __init__(self, base_url: str, group_ids: list[str]):
         self.base_url = base_url.rstrip("/")
-        self.group_id = group_id
+        self.group_ids = [str(g) for g in group_ids]
         self.self_info: dict = {}          # {user_id, nickname}
-        self.member_cache: dict = {}        # {qq: {nickname, card, role, title}}
+        # member_cache 嵌套化：{group_id: {qq: {nickname, card, role, title}}}
+        self.member_cache: dict[str, dict] = {gid: {} for gid in self.group_ids}
 
     # ---------- 启动预热 ----------
     def warmup(self):
-        """启动时预热：拉取自身信息和群成员列表。"""
+        """启动时预热：拉取自身信息和每个群的成员列表。"""
         self.self_info = self.get_login_info()
         logger.info(f"机器人身份：{self.self_info.get('nickname')}({self.self_info.get('user_id')})")
-        members = self.get_group_member_list()
-        for m in members:
-            qq = str(m.get("user_id"))
-            detail = self.get_group_member_info(qq)
-            self.member_cache[qq] = {
-                "nickname": detail.get("nickname", ""),
-                "card": detail.get("card", ""),
-                "role": detail.get("role", "member"),
-                "title": detail.get("title", ""),
-            }
-        logger.info(f"群成员缓存：{len(self.member_cache)} 人")
+        for gid in self.group_ids:
+            members = self.get_group_member_list(gid)
+            for m in members:
+                qq = str(m.get("user_id"))
+                detail = self.get_group_member_info(gid, qq)
+                self.member_cache[gid][qq] = {
+                    "nickname": detail.get("nickname", ""),
+                    "card": detail.get("card", ""),
+                    "role": detail.get("role", "member"),
+                    "title": detail.get("title", ""),
+                }
+            logger.info(f"群 {gid} 成员缓存：{len(self.member_cache[gid])} 人")
 
-    def get_nickname(self, qq: str) -> str:
+    def get_nickname(self, group_id: str, qq: str) -> str:
         """从缓存取昵称（优先群名片）。"""
-        info = self.member_cache.get(qq, {})
+        info = self.member_cache.get(group_id, {}).get(qq, {})
         return info.get("card") or info.get("nickname") or qq
 
     # ---------- OneBot API 调用 ----------
@@ -81,26 +83,26 @@ class NapCatClient:
     def get_login_info(self) -> dict:
         return self._call("get_login_info", {}).get("data", {})
 
-    def get_group_member_list(self) -> list:
-        return self._call("get_group_member_list", {"group_id": self.group_id}).get("data", [])
+    def get_group_member_list(self, group_id: str) -> list:
+        return self._call("get_group_member_list", {"group_id": group_id}).get("data", [])
 
-    def get_group_member_info(self, user_id: str) -> dict:
+    def get_group_member_info(self, group_id: str, user_id: str) -> dict:
         return self._call("get_group_member_info", {
-            "group_id": self.group_id,
+            "group_id": group_id,
             "user_id": user_id,
         }).get("data", {})
 
-    def send_group_msg(self, message: list) -> dict:
+    def send_group_msg(self, group_id: str, message: list) -> dict:
         """发送群消息（消息段数组形式）。"""
         return self._call("send_group_msg", {
-            "group_id": self.group_id,
+            "group_id": group_id,
             "message": message,
         })
 
-    def send_group_ai_record(self, character: str, text: str) -> dict:
+    def send_group_ai_record(self, group_id: str, character: str, text: str) -> dict:
         """发送 AI 语音。"""
         return self._call("send_group_ai_record", {
-            "group_id": self.group_id,
+            "group_id": group_id,
             "character": character,
             "text": text,
         })
@@ -119,14 +121,14 @@ class NapCatClient:
             "set": set_,
         })
 
-    def get_ai_characters(self) -> list:
+    def get_ai_characters(self, group_id: str) -> list:
         """获取群聊可用的 AI 语音角色列表（启动探测用）。
 
         返回 [{"character_id": "...", "character_name": "...", "preview_url": "..."}, ...]
         失败返回空列表。
         """
         resp = self._call("get_ai_characters", {
-            "group_id": self.group_id,
+            "group_id": group_id,
             "chat_type": 1,  # 群聊
         })
         if not resp:
@@ -138,10 +140,10 @@ class NapCatClient:
             characters.extend(item.get("characters", []))
         return characters
 
-    def send_group_forward_msg(self, messages: list, title: str = "") -> dict:
+    def send_group_forward_msg(self, group_id: str, messages: list, title: str = "") -> dict:
         """发送合并转发。"""
         return self._call("send_group_forward_msg", {
-            "group_id": self.group_id,
+            "group_id": group_id,
             "messages": messages,
             "title": title,
         })
@@ -167,19 +169,17 @@ class NapCatWebhookServer:
     """接收 NapCat HTTP 上报的 webhook 服务。
 
     NapCat 收到群消息后会 POST 到本服务，触发回调。
-    若设置 target_group_id，则只处理该群消息，其他群消息直接丢弃。
+    群过滤由 Bot 的回调方法完成（ctx = self.groups.get(group_id); if ctx is None: return）。
     群消息走 on_message 回调，撤回通知（group_recall）走 on_recall 回调，
     戳一戳通知（notify/poke）走 on_poke 回调。
     """
 
     def __init__(self, host: str, port: int, on_message: Callable[[dict], None],
-                 target_group_id: Optional[str] = None,
                  on_recall: Optional[Callable[[dict], None]] = None,
                  on_poke: Optional[Callable[[dict], None]] = None):
         self.host = host
         self.port = port
         self.on_message = on_message
-        self.target_group_id = target_group_id
         self.on_recall = on_recall
         self.on_poke = on_poke
         self._server: Optional[HTTPServer] = None
@@ -189,7 +189,6 @@ class NapCatWebhookServer:
         on_message = self.on_message
         on_recall = self.on_recall
         on_poke = self.on_poke
-        target_group_id = self.target_group_id
 
         class Handler(BaseHTTPRequestHandler):
             def _read_body(self):
@@ -232,36 +231,14 @@ class NapCatWebhookServer:
                     post_type = data.get("post_type", "")
                     logger.info(f"解析成功，post_type={post_type}")
                     if post_type == "message" and data.get("message_type") == "group":
-                        # 群过滤：只处理目标群消息，其他群直接丢弃
-                        msg_group_id = str(data.get("group_id", ""))
-                        if target_group_id and msg_group_id != target_group_id:
-                            logger.debug(
-                                f"丢弃非目标群消息：group_id={msg_group_id} "
-                                f"(期望 {target_group_id}) user={data.get('user_id')}"
-                            )
-                        else:
-                            # 异步处理消息，do_POST 立即返回 200，避免阻塞 NapCat
-                            Thread(target=on_message, args=(data,), daemon=True).start()
+                        # 群过滤由 Bot 回调方法完成（ctx is None 则丢弃）
+                        Thread(target=on_message, args=(data,), daemon=True).start()
                     elif post_type == "notice" and data.get("notice_type") == "group_recall":
-                        # 群撤回通知：群过滤后异步调用 on_recall
-                        msg_group_id = str(data.get("group_id", ""))
-                        if target_group_id and msg_group_id != target_group_id:
-                            logger.debug(
-                                f"丢弃非目标群撤回通知：group_id={msg_group_id} "
-                                f"(期望 {target_group_id})"
-                            )
-                        elif on_recall:
+                        if on_recall:
                             Thread(target=on_recall, args=(data,), daemon=True).start()
                     elif post_type == "notice" and data.get("notice_type") == "notify" \
                             and data.get("sub_type") == "poke":
-                        # 戳一戳通知：群过滤后异步调用 on_poke
-                        msg_group_id = str(data.get("group_id", ""))
-                        if target_group_id and msg_group_id != target_group_id:
-                            logger.debug(
-                                f"丢弃非目标群戳一戳通知：group_id={msg_group_id} "
-                                f"(期望 {target_group_id})"
-                            )
-                        elif on_poke:
+                        if on_poke:
                             Thread(target=on_poke, args=(data,), daemon=True).start()
                 except Exception as e:
                     logger.error(f"处理上报失败: {e}")

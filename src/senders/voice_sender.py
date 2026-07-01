@@ -44,7 +44,7 @@ class AIRecordVoiceSender:
             return {}
 
         # send_group_ai_record 内部已通过 _call 检查业务 status，失败返回 {}
-        result = self.client.send_group_ai_record(self.character, text)
+        result = self.client.send_group_ai_record(group_id, self.character, text)
         if result:
             logger.info(f"AI 语音发送成功: {text[:30]}...")
             return result
@@ -53,7 +53,7 @@ class AIRecordVoiceSender:
         logger.error(f"AI 语音发送失败: character={self.character} text={text[:30]}...")
         if self.fallback_to_text:
             logger.info("降级为 text 段发送（fallback_to_text=true）")
-            return self.client.send_group_msg([
+            return self.client.send_group_msg(group_id, [
                 {"type": "text", "data": {"text": text}},
             ])
         return {}
@@ -83,4 +83,4 @@ class LocalFileVoiceSender:
 
         # 构造 OB11MessageRecord 段（file:// 协议或绝对路径）
         record_seg = [{"type": "record", "data": {"file": file_path}}]
-        return self.client.send_group_msg(record_seg)
+        return self.client.send_group_msg(group_id, record_seg)

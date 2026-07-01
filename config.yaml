@@ -2,7 +2,7 @@
 
 napcat:
   base_url: "http://127.0.0.1:8080"
-  group_id: "114514"        # 目标群号
+  group_ids: ["114514"] # 目标群列表（至少一个）
 
 # 推荐一波配置
 llm:
@@ -13,13 +13,13 @@ llm:
 # 测试用 Persona 卡（开发阶段验证框架，非最终人格）
 # 部署阶段会替换为真实 Persona
 persona:
-  name: 林夏
+  name: 林夏（小夏）
   gender: 女
   age: 23
   location: 杭州
   job: 前端工程师
   traits: [嘴毒心软, 吐槽役, 熟了很跳脱]
-  interests: [原神, 二次元, 写代码, 深夜emo]   # 同时作为评分触发的兴趣关键词
+  interests: [原神, 二次元, 写代码, 深夜emo, 小夏]   # 同时作为评分触发的兴趣关键词
   catchphrases: ["不是吧", "6", "笑死", "真的会谢"]
   style: 常用省略号、偶尔不加句号、爱用单字回应、吐槽时会爆两三句连发
   forbidden:
@@ -31,7 +31,7 @@ persona:
 
 voice:
   ai_record_character: "lucy-voice-f34"   # /send_group_ai_record 的 character 参数
-  fallback_to_text: false             # 备选项：AI 语音调用失败时降级为 text 段，默认关闭
+  fallback_to_text: true              # AI 语音调用失败时降级为 text 段，避免哑火
 
 trigger:
   peek_threshold: 10
@@ -58,7 +58,7 @@ trigger_hard_factors:
 
 # 主动触发（让 bot 像真人一样有时会主动开口）
 active_trigger:
-  enabled: true
+  enabled: false                 # 阶段 B 关闭，阶段 D 每群独立倒计时后开启
   min_interval_minutes: 60        # 主动触发最小间隔（分钟）
   max_interval_minutes: 420        # 主动触发最大间隔（分钟）
   night_start_hour: 23             # 深夜起始小时（此区间内禁用主动触发）

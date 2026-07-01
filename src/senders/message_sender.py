@@ -18,7 +18,7 @@ class NapCatMessageSender:
 
     def send_group_message(self, group_id: str, segments: list[dict]) -> dict:
         """发送消息段数组到指定群。"""
-        return self.client.send_group_msg(segments)
+        return self.client.send_group_msg(group_id, segments)
 
     def build_segments(self, messages: list, history) -> list[list[dict]]:
         """把模型输出的 messages 转换为 OneBot 消息段数组的列表。

@@ -11,7 +11,7 @@
 全局共享单例（napcat, llm, affinity, persona）由 Bot 注入引用。
 
 阶段 A：纯结构抽取，单群运行，零行为变化。
-阶段 B 起才真正多群化（文件名加 group_id 后缀、napcat 方法接受 group_id 等）。
+阶段 B：per-group 子目录 state/{group_id}/，多群独立文件存储。
 """
 import threading
 from typing import Optional
@@ -41,6 +41,7 @@ class GroupContext:
         affinity: AffinityManager,
         self_qq: str,
         persona_name: str,
+        state_dir: str = "state",
     ):
         self.group_id = group_id
         self.config = config
@@ -50,11 +51,11 @@ class GroupContext:
         self.llm = llm
         self.affinity = affinity
 
-        # per-group 状态管理器
-        # 注：阶段 A 保持默认文件名（conversation.json / state.json），阶段 B 再参数化
-        self.history = HistoryManager(config.trigger)
+        # per-group 状态管理器（子目录隔离：state/{group_id}/）
+        per_group_state_dir = f"{state_dir}/{group_id}"
+        self.history = HistoryManager(config.trigger, state_dir=per_group_state_dir)
         self.history.set_summarizer(llm.summarize)
-        self.attribution = AttributionManager(config)
+        self.attribution = AttributionManager(config, state_dir=per_group_state_dir)
         self.trigger_evaluator = TriggerEvaluator(
             config, self.history, self_qq, persona_name,
             affinity_manager=affinity,

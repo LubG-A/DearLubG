@@ -7,7 +7,7 @@ import yaml
 @dataclass
 class NapCatConfig:
     base_url: str
-    group_id: str
+    group_ids: list = field(default_factory=list)  # 群列表（至少一个）
 
 
 @dataclass
@@ -85,7 +85,10 @@ def load_config(path: str = "config.yaml") -> Config:
     )
 
     return Config(
-        napcat=NapCatConfig(**raw["napcat"]),
+        napcat=NapCatConfig(
+            base_url=raw["napcat"]["base_url"],
+            group_ids=raw["napcat"].get("group_ids", []),
+        ),
         llm=LLMConfig(**raw["llm"]),
         persona=PersonaConfig(**raw["persona"]),
         voice=VoiceConfig(**raw["voice"]),
