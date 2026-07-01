@@ -332,6 +332,18 @@ class HistoryManager:
         """返回传给 LLM 的 messages 列表（不含 system，system 由调用方拼接）。"""
         return self.messages.copy()
 
+    def get_recent_user_contents(self, n: int = 10) -> list[str]:
+        """获取近 N 轮 user content（用于印记板摘要输入）。
+
+        Args:
+            n: 取最近 N 条 role=user 的 content
+
+        Returns:
+            user content 文本列表，按时间正序（旧→新）
+        """
+        user_msgs = [m for m in self.messages if m.get("role") == "user"]
+        return [m["content"] for m in user_msgs[-n:] if "content" in m]
+
     def get_recent_speakers(self, recent_turns: int = 6) -> set:
         """获取最近 N 轮对话中发言过的 QQ 集合（含当前 pending）。
 

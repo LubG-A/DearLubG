@@ -36,6 +36,18 @@ class LLMClient:
         "只输出摘要正文，不要任何前缀或解释。"
     )
 
+    # 印记板摘要用的 system prompt（阶段C：双维度印记）
+    _IMPRESSION_SUMMARY_PROMPT = (
+        "你是群聊印象助手。根据以下群聊消息，生成这个群的印象，包含两部分：\n"
+        "1. topic：1句话描述\"这个群最近在聊什么\"，包括主要话题和关键事件（如日程、约定、重要决定）\n"
+        "2. people：1-2句话描述\"群里的人有什么特征和关系\"，用\"昵称(完整QQ)\"格式标注人物\n\n"
+        "要求：\n"
+        "- 提到的人一律用\"昵称(完整QQ)\"格式，如\"张三(1234567890)\"，确保跨群身份关联准确\n"
+        "- people 部分关注人物性格特征和人物之间的关系（如谁和谁经常互怼、谁总是帮谁说话）\n"
+        "- topic 和 people 各 ≤100 字\n"
+        "- 只输出 JSON，不要任何前缀或解释，格式：{\"topic\": \"...\", \"people\": \"...\"}"
+    )
+
     def __init__(self, config: Config):
         self.api_url = config.llm.api_url
         self.api_key = config.llm.api_key
@@ -137,4 +149,61 @@ class LLMClient:
             return None
         except (KeyError, IndexError) as e:
             logger.warning(f"LLM 历史摘要响应解析失败: {e}")
+            return None
+
+    def summarize_for_impression(self, group_id: str, recent_user_contents: list[str]) -> Optional[dict]:
+        """为印记板生成群印记+人印记（阶段C）。
+
+        Args:
+            group_id: 群号（用于日志）
+            recent_user_contents: 近 N 轮 user content 文本列表
+
+        Returns:
+            {"topic": "群话题文本", "people": "人物特征文本"}，失败返回 None
+        """
+        if not recent_user_contents:
+            return None
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        # 拼接近 N 轮 user content（只取消息正文部分，每轮后 300 字）
+        lines = []
+        for content in recent_user_contents:
+            text = content[-300:] if len(content) > 300 else content
+            lines.append(text)
+        dialog_text = "\n---\n".join(lines)
+
+        messages = [
+            {"role": "system", "content": self._IMPRESSION_SUMMARY_PROMPT},
+            {"role": "user", "content": f"以下是群 {group_id} 近期的群聊消息：\n\n{dialog_text}"},
+        ]
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+        }
+
+        try:
+            resp = requests.post(self.api_url, headers=headers, json=payload, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            # 解析 JSON 输出
+            result = json.loads(content)
+            if not isinstance(result, dict) or "topic" not in result or "people" not in result:
+                logger.warning(f"群 {group_id} 印记摘要 JSON 格式异常: {content[:100]}")
+                return None
+            logger.info(f"群 {group_id} 印记摘要生成成功: topic={result['topic'][:30]}... people={result['people'][:30]}...")
+            return result
+        except json.JSONDecodeError as e:
+            logger.warning(f"群 {group_id} 印记摘要 JSON 解析失败: {e}")
+            return None
+        except requests.RequestException as e:
+            logger.warning(f"群 {group_id} 印记摘要请求失败: {e}")
+            return None
+        except (KeyError, IndexError) as e:
+            logger.warning(f"群 {group_id} 印记摘要响应解析失败: {e}")
             return None
