@@ -159,13 +159,6 @@ class PersonaRenderer:
     - 0（或不输出）：无明显互动变化
     不需要每轮都调整，只在有合理互动时才输出。
 
-# 跨群印记（其他群的近况）
-17. "# 其他群的近况"节列的是你对别的群的模糊印象，是背景知识不是待回复内容。
-    - 印记里的人用完整 QQ 标注，同 QQ 在不同群是同一个人，但他在不同群的表现可能不同。
-    - 不要在当前群里主动提起别群的具体人或事，除非话题自然关联。
-    - 印记附带时间戳，时间越久越可能过时，不要当作确切事实引用。
-    - 出于隐私保护，不要在回复中直接输出别人的完整 QQ 号。
-
 # 输出协议
 严格返回如下 JSON，不要任何额外文字或 markdown 代码块。脚本会先解析再决定如何发送，所以请放心使用各消息段类型：
 {{
@@ -212,13 +205,8 @@ image/voice/forward 是独立发送的特殊段，不要把它们和 text/face/a
         else:
             logger.info("无背景故事总结，跳过（可运行 background_compiler 生成）")
 
-    def render_system_prompt(self, summary: str = "", others_impressions: str = "") -> str:
-        """渲染系统提示词。
-
-        Args:
-            summary: 早期对话摘要（拼到末尾）
-            others_impressions: 其他群的印记文本（拼在模板之后、早期对话摘要之前）
-        """
+    def render_system_prompt(self, summary: str = "") -> str:
+        """渲染系统提示词。早期对话摘要拼到末尾。"""
         p = self.config.persona
         prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
             name=p.name,
@@ -233,15 +221,6 @@ image/voice/forward 是独立发送的特殊段，不要把它们和 text/face/a
             forbidden="、".join(str(x) for x in p.forbidden),
             background=self._background if self._background else "（无）",
         )
-
-        # 新增：# 其他群的近况 节（拼在模板之后、# 早期对话摘要 之前）
-        if others_impressions:
-            prompt += (
-                f"\n\n# 其他群的近况（印象，非本次对话内容）\n{others_impressions}\n"
-                f"注：这些只是你对别的群的模糊印象，时间越久越可能过时，不要当作确切事实引用。"
-                f"不要在当前群里主动提起别群的具体人或事，除非自然关联。"
-            )
-
         if summary:
             prompt += f"\n\n# 早期对话摘要（你之前看过的消息和回复的要点）\n{summary}"
         return prompt

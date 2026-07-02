@@ -34,7 +34,6 @@ from src.config import load_config
 from src.napcat_client import NapCatClient, NapCatWebhookServer
 from src.llm_client import LLMClient
 from src.affinity import AffinityManager
-from src.impression import CrossGroupImpressionStore, IMPRESSION_SNAPSHOT_TURNS
 from src.persona import PersonaRenderer
 from src.parser import parse_and_validate
 from src.senders.message_sender import NapCatMessageSender
@@ -64,7 +63,6 @@ class Bot:
         self.napcat = NapCatClient(self.config.napcat.base_url, self.config.napcat.group_ids)
         self.llm = LLMClient(self.config)
         self.affinity = AffinityManager()  # 全局按 QQ（跨群身份一致）
-        self.impression_board = CrossGroupImpressionStore()  # 跨群印记板（阶段 C）
         self.persona_renderer = PersonaRenderer(self.config)
 
         # Sender 实现（全局共享）
@@ -118,7 +116,6 @@ class Bot:
         self._probe_ai_voice_character()
         logger.info(f"预热完成，机器人 {self.self_nickname}({self.self_qq})，"
                     f"群 {list(self.groups.keys())}")
-        logger.info(f"跨群印记板：{len(self.impression_board.impressions)} 个群有印记")
 
         # 阶段 D：为每群启动主动触发调度器（per-group 独立倒计时）
         if self.config.active_trigger and self.config.active_trigger.enabled:
@@ -510,11 +507,7 @@ class Bot:
 
             # 4. 构建 user_content（创建快照供 reply/react 段引用）
             summary = ctx.history.get_summary()
-            # 阶段 C：获取其他群印记，注入 system prompt
-            others_impressions = self.impression_board.get_others_impressions(ctx.group_id)
-            system_prompt = self.persona_renderer.render_system_prompt(
-                summary, others_impressions=others_impressions
-            )
+            system_prompt = self.persona_renderer.render_system_prompt(summary)
             history_messages = ctx.history.get_messages_for_llm()
             member_list = self._build_member_list(ctx)
             pending_text = ctx.history.build_user_content()
@@ -551,13 +544,6 @@ class Bot:
 
             # 7. 发送 + 归因（不持锁，发送期间群消息和 bot 回复都进 fast_buffer）
             self._handle_result(ctx, parsed, soft_factors)
-
-            # 7.5 印记板惰性更新（LLM 调用成功后，取近 N 轮 user content 做摘要）
-            # 延迟回复路径已在步骤 6 return，不会走到这里
-            recent_user_contents = ctx.history.get_recent_user_contents(IMPRESSION_SNAPSHOT_TURNS)
-            self.impression_board.maybe_update(
-                ctx.group_id, recent_user_contents, self.llm.summarize_for_impression
-            )
 
             # 8. 检查重试：cycle 期间有新触发撞上则重跑（不传 soft_factors，归因跳过）
             #    - 若本轮 cycle 发了回复（last_reply_time 新近）：刚说过话，新消息攒着等静默窗口兜底
