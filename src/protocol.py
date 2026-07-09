@@ -1,6 +1,6 @@
 """协议接口定义。
 
-主流程只依赖以下 4 个协议接口，不依赖具体实现。
+主流程只依赖以下 5 个协议接口，不依赖具体实现。
 各接口的"空实现"或"预留实现"在后续迭代中替换为真实实现时，主流程零修改。
 """
 from typing import Protocol, Any
@@ -23,14 +23,14 @@ class MessageSender(Protocol):
 
 
 class VoiceSender(Protocol):
-    """语音发送接口。channel 字段决定具体实现（ai_record / local_file）。"""
+    """语音发送接口。channel 字段决定具体实现（ai_record / local_file / url）。"""
 
     def send(self, group_id: str, voice_data: dict) -> dict:
         """发送语音消息。
 
         Args:
             group_id: 目标群号
-            voice_data: 语音数据，含 channel/text/file 等字段
+            voice_data: 语音数据，含 channel/text/file/url 等字段
 
         Returns:
             NapCat 返回的响应字典
@@ -39,14 +39,30 @@ class VoiceSender(Protocol):
 
 
 class ImageSender(Protocol):
-    """图片发送接口。当前阶段为空实现。"""
+    """图片发送接口。按 data.url/data.file 字段决定网络/本地通道。"""
 
     def send(self, group_id: str, image_data: dict) -> dict:
         """发送图片消息。
 
         Args:
             group_id: 目标群号
-            image_data: 图片数据，含 url/summary 等字段
+            image_data: 图片数据，含 url（网络）或 file（本地）字段
+
+        Returns:
+            NapCat 返回的响应字典
+        """
+        ...
+
+
+class VideoSender(Protocol):
+    """视频发送接口。按 data.url/data.file 字段决定网络/本地通道。"""
+
+    def send(self, group_id: str, video_data: dict) -> dict:
+        """发送视频消息。
+
+        Args:
+            group_id: 目标群号
+            video_data: 视频数据，含 url（网络）或 file（本地）字段
 
         Returns:
             NapCat 返回的响应字典

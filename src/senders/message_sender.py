@@ -97,8 +97,16 @@ class NapCatMessageSender:
             return [{"type": "forward", "data": data}]
 
         if msg_type == "voice":
-            # voice 由 main._send_messages 根据 channel 分发到 AIRecordVoiceSender / LocalFileVoiceSender
+            # voice 由 main._send_messages 根据 channel 分发到 AIRecordVoiceSender / LocalFileVoiceSender / UrlVoiceSender
             return [{"type": "voice", "data": data}]
+
+        if msg_type == "image":
+            # image 由 main._send_messages 调用 ImageSender（按 data.url/data.file 走网络/本地）
+            return [{"type": "image", "data": data}]
+
+        if msg_type == "video":
+            # video 由 main._send_messages 调用 VideoSender（按 data.url/data.file 走网络/本地）
+            return [{"type": "video", "data": data}]
 
         logger.warning(f"未知消息段 type={msg_type}，跳过")
         return []

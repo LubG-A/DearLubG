@@ -11,7 +11,7 @@ from .utils.logger import get_logger
 logger = get_logger("parser")
 
 VALID_ACTIONS = {"silent", "reply", "react", "multi_reply"}
-VALID_MSG_TYPES = {"text", "at", "reply", "face", "image", "voice", "forward"}
+VALID_MSG_TYPES = {"text", "at", "reply", "face", "image", "voice", "video", "forward"}
 
 
 @dataclass

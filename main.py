@@ -37,8 +37,9 @@ from src.affinity import AffinityManager
 from src.persona import PersonaRenderer
 from src.parser import parse_and_validate
 from src.senders.message_sender import NapCatMessageSender
-from src.senders.voice_sender import AIRecordVoiceSender, LocalFileVoiceSender
-from src.senders.image_sender import EmptyImageSender
+from src.senders.voice_sender import AIRecordVoiceSender, LocalFileVoiceSender, UrlVoiceSender
+from src.senders.image_sender import NapCatImageSender
+from src.senders.video_sender import NapCatVideoSender
 from src.senders.emoji_reactor import EmojiReactor
 from src.group_context import GroupContext
 from src.utils.logger import get_logger
@@ -71,7 +72,9 @@ class Bot:
             self.napcat, self.config.voice.ai_record_character, self.config.voice.fallback_to_text
         )
         self.local_voice_sender = LocalFileVoiceSender(self.napcat)
-        self.image_sender = EmptyImageSender()
+        self.url_voice_sender = UrlVoiceSender(self.napcat)
+        self.image_sender = NapCatImageSender(self.napcat)
+        self.video_sender = NapCatVideoSender(self.napcat)
         self.emoji_reactor = EmojiReactor(self.napcat)
 
         # 全局运行时状态
@@ -630,10 +633,11 @@ class Bot:
                     handled = True
                     break
                 if seg.get("type") == "image":
-                    try:
-                        self.image_sender.send(ctx.group_id, seg.get("data", {}))
-                    except NotImplementedError:
-                        pass
+                    self.image_sender.send(ctx.group_id, seg.get("data", {}))
+                    handled = True
+                    break
+                if seg.get("type") == "video":
+                    self.video_sender.send(ctx.group_id, seg.get("data", {}))
                     handled = True
                     break
                 if seg.get("type") == "voice":
@@ -643,15 +647,17 @@ class Bot:
                         self.ai_voice_sender.send(ctx.group_id, data)
                     elif channel == "local_file":
                         self.local_voice_sender.send(ctx.group_id, data)
+                    elif channel == "url":
+                        self.url_voice_sender.send(ctx.group_id, data)
                     handled = True
                     break
             if handled:
-                # 特殊段也记入 fast_buffer（语音/图片/转发都算一条 bot 发言）
+                # 特殊段也记入 fast_buffer（语音/图片/视频/转发都算一条 bot 发言）
                 self._append_bot_reply_to_buffer(ctx, messages[i])
                 continue
 
             # 普通消息段
-            normal_segs = [s for s in segs if s.get("type") not in ("forward", "image", "voice")]
+            normal_segs = [s for s in segs if s.get("type") not in ("forward", "image", "video", "voice")]
             if normal_segs:
                 self.message_sender.send_group_message(ctx.group_id, normal_segs)
 
