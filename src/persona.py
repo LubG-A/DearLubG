@@ -222,7 +222,7 @@ image/voice/forward 是独立发送的特殊段，不要把它们和 text/face/a
             background=self._background if self._background else "（无）",
         )
         if summary:
-            prompt += f"\n\n# 早期对话摘要（你之前看过的消息和回复的要点）\n{summary}"
+            prompt += f"\n\n# 早期对话摘要（你之前看过的消息）\n注：摘要内容不属于当前对话，而是早期历史对话总结。除非与当前的主题存在自然关联，否则不应主动对摘要的内容进行处理。\n{summary}"
         return prompt
 
     def render_user_content(self, history_context: str, member_list: list, my_nickname: str, my_qq: str,
