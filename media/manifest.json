@@ -1,0 +1,15 @@
+{
+  "_comment": "多媒体素材库清单（人工维护）。启动时由 MediaLibrary 加载，渲染到 system prompt 的 '# 你的素材库' 节。每条记录：type=file 时用 path 字段（本地相对/绝对路径），type=url 时用 url 字段（网络地址）。desc 是给 LLM 看的内容描述，决定 LLM 在什么语境下选这个文件。修改本文件后重启生效（像 background_story 一样，不每次 render 重读）。",
+  "audio": [
+    {"type": "file", "path": "media/audio/example.mp3", "desc": "示例音频"},
+    {"type": "url", "url": "https://example.com/audio/example.mp3", "desc": "示例音频"}
+  ],
+  "video": [
+    {"type": "file", "path": "media/video/example.mp4", "desc": "示例视频"},
+    {"type": "url", "url": "https://example.com/video/example.mp4", "desc": "示例视频"}
+  ],
+  "image": [
+    {"type": "file", "path": "media/image/example.jpg", "desc": "示例图片"},
+    {"type": "url", "url": "https://example.com/image/example.jpg", "desc": "示例图片"}
+  ]
+}
