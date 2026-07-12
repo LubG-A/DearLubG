@@ -33,6 +33,12 @@ voice:
   ai_record_character: "lucy-voice-f34"   # /send_group_ai_record 的 character 参数
   fallback_to_text: true              # AI 语音调用失败时降级为 text 段，避免哑火
 
+# 媒体下载配置（网络资源统一本地化：先下载到本地再以 file:// URI 发送给 NapCat）
+media_download:
+  timeout: 30                          # 普通资源（图片/语音）下载超时（秒）
+  video_timeout: 60                    # 视频资源下载超时（秒）
+  temp_dir: "media/downloaded"         # 临时文件目录
+
 trigger:
   peek_threshold: 10
   silent_buffer_limit: 30

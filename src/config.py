@@ -59,6 +59,14 @@ class ActiveTriggerConfig:
 
 
 @dataclass
+class MediaDownloadConfig:
+    """媒体下载配置：网络资源先下载到本地再发送，规避 NapCat 10s 超时。"""
+    timeout: int = 30                 # 普通资源（图片/语音）下载超时（秒）
+    video_timeout: int = 60           # 视频资源下载超时（秒）
+    temp_dir: str = "media/downloaded"  # 临时文件目录
+
+
+@dataclass
 class Config:
     napcat: NapCatConfig
     llm: LLMConfig
@@ -68,6 +76,7 @@ class Config:
     trigger_factors: dict      # 软因子 base_value
     trigger_hard_factors: dict # 硬因子 base_value（不参与归因）
     active_trigger: ActiveTriggerConfig = None  # 主动触发配置
+    media_download: MediaDownloadConfig = None  # 媒体下载配置
 
 
 def load_config(path: str = "config.yaml") -> Config:
@@ -84,6 +93,13 @@ def load_config(path: str = "config.yaml") -> Config:
         night_end_hour=active_raw.get("night_end_hour", 3),
     )
 
+    md_raw = raw.get("media_download", {})
+    media_download = MediaDownloadConfig(
+        timeout=md_raw.get("timeout", 30),
+        video_timeout=md_raw.get("video_timeout", 60),
+        temp_dir=md_raw.get("temp_dir", "media/downloaded"),
+    )
+
     return Config(
         napcat=NapCatConfig(
             base_url=raw["napcat"]["base_url"],
@@ -96,4 +112,5 @@ def load_config(path: str = "config.yaml") -> Config:
         trigger_factors=raw.get("trigger_factors", {}),
         trigger_hard_factors=raw.get("trigger_hard_factors", {}),
         active_trigger=active,
+        media_download=media_download,
     )

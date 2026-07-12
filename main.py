@@ -72,9 +72,14 @@ class Bot:
             self.napcat, self.config.voice.ai_record_character, self.config.voice.fallback_to_text
         )
         self.local_voice_sender = LocalFileVoiceSender(self.napcat)
-        self.url_voice_sender = UrlVoiceSender(self.napcat)
-        self.image_sender = NapCatImageSender(self.napcat)
-        self.video_sender = NapCatVideoSender(self.napcat)
+        # 网络资源 sender 注入下载超时与临时目录（从 config.media_download 读取，缺失用默认值）
+        md = getattr(self.config, "media_download", None)
+        md_timeout = md.timeout if md else 30
+        md_video_timeout = md.video_timeout if md else 60
+        md_temp_dir = md.temp_dir if md else "media/downloaded"
+        self.url_voice_sender = UrlVoiceSender(self.napcat, timeout=md_timeout, temp_dir=md_temp_dir)
+        self.image_sender = NapCatImageSender(self.napcat, timeout=md_timeout, temp_dir=md_temp_dir)
+        self.video_sender = NapCatVideoSender(self.napcat, timeout=md_video_timeout, temp_dir=md_temp_dir)
         self.emoji_reactor = EmojiReactor(self.napcat)
 
         # 全局运行时状态
@@ -626,34 +631,39 @@ class Bot:
         for i, segs in enumerate(segments_list):
             # 处理特殊段
             handled = False
+            sent_ok = True  # 特殊段发送是否成功；失败时不 append 到 fast_buffer（保持历史事实性）
             for seg in segs:
                 if seg.get("type") == "forward":
                     data = seg.get("data", {})
-                    self.napcat.send_group_forward_msg(ctx.group_id, data.get("messages", []), data.get("title", ""))
+                    resp = self.napcat.send_group_forward_msg(ctx.group_id, data.get("messages", []), data.get("title", ""))
                     handled = True
+                    sent_ok = bool(resp)
                     break
                 if seg.get("type") == "image":
-                    self.image_sender.send(ctx.group_id, seg.get("data", {}))
+                    sent_ok = self.image_sender.send(ctx.group_id, seg.get("data", {}))
                     handled = True
                     break
                 if seg.get("type") == "video":
-                    self.video_sender.send(ctx.group_id, seg.get("data", {}))
+                    sent_ok = self.video_sender.send(ctx.group_id, seg.get("data", {}))
                     handled = True
                     break
                 if seg.get("type") == "voice":
                     data = seg.get("data", {})
                     channel = data.get("channel", "ai_record")
                     if channel == "ai_record":
-                        self.ai_voice_sender.send(ctx.group_id, data)
+                        sent_ok = self.ai_voice_sender.send(ctx.group_id, data)
                     elif channel == "local_file":
-                        self.local_voice_sender.send(ctx.group_id, data)
+                        sent_ok = self.local_voice_sender.send(ctx.group_id, data)
                     elif channel == "url":
-                        self.url_voice_sender.send(ctx.group_id, data)
+                        sent_ok = self.url_voice_sender.send(ctx.group_id, data)
                     handled = True
                     break
             if handled:
-                # 特殊段也记入 fast_buffer（语音/图片/视频/转发都算一条 bot 发言）
-                self._append_bot_reply_to_buffer(ctx, messages[i])
+                if sent_ok:
+                    # 特殊段记入 fast_buffer（语音/图片/视频/转发都算一条 bot 发言）
+                    self._append_bot_reply_to_buffer(ctx, messages[i])
+                else:
+                    logger.warning("特殊段发送失败，不记录到历史（保持历史事实性）")
                 continue
 
             # 普通消息段

@@ -25,7 +25,7 @@ class MessageSender(Protocol):
 class VoiceSender(Protocol):
     """语音发送接口。channel 字段决定具体实现（ai_record / local_file / url）。"""
 
-    def send(self, group_id: str, voice_data: dict) -> dict:
+    def send(self, group_id: str, voice_data: dict) -> bool:
         """发送语音消息。
 
         Args:
@@ -33,15 +33,17 @@ class VoiceSender(Protocol):
             voice_data: 语音数据，含 channel/text/file/url 等字段
 
         Returns:
-            NapCat 返回的响应字典
+            True=发送成功，False=失败（调用方据此决定是否记录到历史）
         """
         ...
 
 
 class ImageSender(Protocol):
-    """图片发送接口。按 data.url/data.file 字段决定网络/本地通道。"""
+    """图片发送接口。按 data.url/data.file 字段决定网络/本地通道。
+    网络通道先同步下载到本地（规避 NapCat 10s 超时），再走 file 通道。
+    """
 
-    def send(self, group_id: str, image_data: dict) -> dict:
+    def send(self, group_id: str, image_data: dict) -> bool:
         """发送图片消息。
 
         Args:
@@ -49,15 +51,17 @@ class ImageSender(Protocol):
             image_data: 图片数据，含 url（网络）或 file（本地）字段
 
         Returns:
-            NapCat 返回的响应字典
+            True=发送成功，False=失败（调用方据此决定是否记录到历史）
         """
         ...
 
 
 class VideoSender(Protocol):
-    """视频发送接口。按 data.url/data.file 字段决定网络/本地通道。"""
+    """视频发送接口。按 data.url/data.file 字段决定网络/本地通道。
+    网络通道先同步下载到本地（规避 NapCat 10s 超时），再走 file 通道。
+    """
 
-    def send(self, group_id: str, video_data: dict) -> dict:
+    def send(self, group_id: str, video_data: dict) -> bool:
         """发送视频消息。
 
         Args:
@@ -65,7 +69,7 @@ class VideoSender(Protocol):
             video_data: 视频数据，含 url（网络）或 file（本地）字段
 
         Returns:
-            NapCat 返回的响应字典
+            True=发送成功，False=失败（调用方据此决定是否记录到历史）
         """
         ...
 
