@@ -49,7 +49,7 @@ class NapCatClient:
         return info.get("card") or info.get("nickname") or qq
 
     # ---------- OneBot API 调用 ----------
-    def _call(self, endpoint: str, payload: dict, quiet: bool = False) -> dict:
+    def _call(self, endpoint: str, payload: dict, quiet: bool = False, timeout: int = 10) -> dict:
         """通用 API 调用。
 
         检查业务 status：NapCat 返回 {"status":"ok"/"failed", "retcode":..., "message":...}。
@@ -59,10 +59,12 @@ class NapCatClient:
         Args:
             quiet: True 时业务失败记 INFO（用于重试场景，避免重试期间的正常失败
                    刷 ERROR）；False（默认）记 ERROR，保持其他调用方的既有行为。
+            timeout: HTTP 请求超时（秒），默认 10s。send_group_msg 传更大值
+                    （含媒体时 NapCat 需上传到 QQ 服务器，可能 >10s）。
         """
         url = f"{self.base_url}/{endpoint}"
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            resp = requests.post(url, json=payload, timeout=timeout)
             resp.raise_for_status()
             data = resp.json()
             # 检查业务状态（NapCat 失败时 HTTP 仍是 200）
@@ -92,12 +94,16 @@ class NapCatClient:
             "user_id": user_id,
         }).get("data", {})
 
-    def send_group_msg(self, group_id: str, message: list) -> dict:
-        """发送群消息（消息段数组形式）。"""
+    def send_group_msg(self, group_id: str, message: list, timeout: int = 30) -> dict:
+        """发送群消息（消息段数组形式）。
+
+        timeout 默认 30s：含媒体的 send_group_msg 需要 NapCat 上传文件到 QQ 服务器，
+        可能超过普通 API 的 10s。纯文本消息秒级返回，不受影响。
+        """
         return self._call("send_group_msg", {
             "group_id": group_id,
             "message": message,
-        })
+        }, timeout=timeout)
 
     def send_group_ai_record(self, group_id: str, character: str, text: str) -> dict:
         """发送 AI 语音。"""
