@@ -96,5 +96,5 @@ def download_to_local(
         logger.warning(f"媒体写入文件失败: {e} (path={output_path})")
         return None
 
-    logger.info(f"媒体已下载到本地: {output_path.name} ({len(resp.content)} bytes)")
+    logger.info(f"媒体已下载到本地: {output_path.name}")
     return str(output_path)
