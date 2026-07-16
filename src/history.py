@@ -329,8 +329,43 @@ class HistoryManager:
 
     # ---------- 查询 ----------
     def get_messages_for_llm(self) -> list[dict]:
-        """返回传给 LLM 的 messages 列表（不含 system，system 由调用方拼接）。"""
-        return self.messages.copy()
+        """返回传给 LLM 的 messages 列表（不含 system，system 由调用方拼接）。
+
+        P003 方案 A：对历史 user message 做标记转换，消除"回复触发点"：
+        - 除最后一条 user 外，user content 开头的 "# 当前上下文" → "# 历史上下文"
+        - 除最后一条 user 外，删除末尾的 "请输出 JSON。"
+        目的：让 LLM 明确区分历史参考材料与当前请求，避免注意力漂移到历史旧话题。
+
+        转换在返回时做，不持久化到 conversation.json，不影响其他功能。
+        """
+        messages = self.messages.copy()
+        if not messages:
+            return messages
+
+        # 找到最后一条 user 的索引
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i]["role"] == "user":
+                last_user_idx = i
+                break
+
+        # 对除最后一条 user 外的所有 user content 做转换
+        result = []
+        for i, m in enumerate(messages):
+            if m["role"] == "user" and i != last_user_idx:
+                content = m["content"]
+                # 替换开头标记
+                if content.startswith("# 当前上下文"):
+                    content = "# 历史上下文" + content[len("# 当前上下文"):]
+                # 删除末尾的"请输出 JSON。"（兼容不同换行情况）
+                for suffix in ("\n\n请输出 JSON。", "\n请输出 JSON。", "请输出 JSON。"):
+                    if content.endswith(suffix):
+                        content = content[:-len(suffix)]
+                        break
+                result.append({"role": "user", "content": content})
+            else:
+                result.append(m)
+        return result
 
     def get_recent_speakers(self, recent_turns: int = 6) -> set:
         """获取最近 N 轮对话中发言过的 QQ 集合（含当前 pending）。
