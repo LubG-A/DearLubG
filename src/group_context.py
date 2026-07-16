@@ -73,3 +73,12 @@ class GroupContext:
         self._quiet_timer: Optional[threading.Timer] = None
         self._quiet_timer_lock = threading.Lock()
         self._cycle_pending: bool = False
+
+        # 阶段 F：对话活跃度感知（direct 模式快速触发）
+        # conversation_mode: "direct"=Bot 正在与某人往返对话 / "open"=开放插话
+        # direct_targets: {qq: deadline_timestamp}，每个 target 各自独立 30s 窗口
+        #   - Bot 回复且 conversation_mode=direct + targets 非空时设置
+        #   - target 在窗口内发言触发快速触发（绕过 peek_threshold）
+        #   - silent 保留状态，自然衰减/LLM 主动 open 时清空
+        self.conversation_mode: str = "open"
+        self.direct_targets: dict[str, float] = {}

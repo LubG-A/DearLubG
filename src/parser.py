@@ -12,6 +12,7 @@ logger = get_logger("parser")
 
 VALID_ACTIONS = {"silent", "reply", "react", "multi_reply"}
 VALID_MSG_TYPES = {"text", "at", "reply", "face", "image", "voice", "video", "forward"}
+VALID_CONVERSATION_MODES = {"direct", "open"}
 
 
 @dataclass
@@ -26,6 +27,7 @@ class ParsedResult:
     delay_seconds: int = 0
     affinity_delta: dict = field(default_factory=dict)
     reply_delay_minutes: int = 0  # 延迟回复：N 分钟后再回这批消息
+    conversation_mode: str = "open"  # 阶段 F：direct=与某人往返对话 / open=开放插话
 
 
 def parse_and_validate(raw_content: str) -> ParsedResult:
@@ -147,6 +149,13 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
     if action == "react" and not react_id:
         logger.warning("react_target_msg_id 为空，react 段将无法定位消息")
 
+    # 阶段 F：conversation_mode 校验（direct=与某人往返对话 / open=开放插话）
+    # 缺失/非法值降级为 open（保守降级，不影响现有逻辑）
+    conversation_mode = data.get("conversation_mode", "open")
+    if conversation_mode not in VALID_CONVERSATION_MODES:
+        logger.warning(f"非法 conversation_mode={conversation_mode}，降级为 open")
+        conversation_mode = "open"
+
     return ParsedResult(
         thought=data.get("thought", ""),
         action=action,
@@ -157,6 +166,7 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
         delay_seconds=int(delay),
         affinity_delta=cleaned_delta,
         reply_delay_minutes=final_reply_delay,
+        conversation_mode=conversation_mode,
     )
 
 

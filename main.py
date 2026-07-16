@@ -47,10 +47,11 @@ from src.utils.logger import get_logger
 logger = get_logger("main")
 
 # 冷却配置
-HARD_COOLDOWN_SECONDS = 5       # 硬因子（@/提问）触发冷却，距上次回复 <5s 推迟
-SOFT_COOLDOWN_MIN = 10         # 软因子触发冷却下限
+HARD_COOLDOWN_SECONDS = 3       # 硬因子（@/提问）触发冷却，距上次回复 <5s 推迟
+SOFT_COOLDOWN_MIN = 5         # 软因子触发冷却下限
 SOFT_COOLDOWN_MAX = 60         # 软因子触发冷却上限
 QUIET_WINDOW_SECONDS = 150       # 静默窗口：N 秒无新消息后兜底触发
+DIRECT_WINDOW_SECONDS = 45      # 阶段 F：direct 模式活跃窗口，target 在此窗口内发言触发快速触发
 
 
 class Bot:
@@ -259,12 +260,21 @@ class Bot:
             is_hard = self._is_hard_trigger(ctx, msg, content)
             logger.debug(f"消息评分={score} hard={is_hard} soft_factors={[f.name for f in soft_factors]}")
 
-            # 3. 触发决策
+            # 3. 触发决策（按优先级：硬因子 > direct 快速触发 > 软因子 > 静默兜底）
             if is_hard:
                 self._try_trigger_immediate(ctx, hard=True)
-            elif ctx.trigger_evaluator.should_peek(score):
-                self._try_trigger_immediate(ctx, hard=False, soft_factors=soft_factors)
-            # 低分消息不立即触发，等静默窗口兜底
+            else:
+                # 阶段 F：direct 快速触发——发送者在 direct_targets 字典中且未过该 target 的 deadline
+                # 绕过 peek_threshold，直接让 LLM 看一眼（LLM 仍决定 silent/reply）
+                now_ts = time.time()
+                direct_deadline = ctx.direct_targets.get(sender_qq)
+                if direct_deadline is not None and direct_deadline > now_ts:
+                    # 续命：重置该 target 的 deadline
+                    ctx.direct_targets[sender_qq] = now_ts + DIRECT_WINDOW_SECONDS
+                    self._try_trigger_immediate(ctx, direct=True)
+                elif ctx.trigger_evaluator.should_peek(score):
+                    self._try_trigger_immediate(ctx, hard=False, soft_factors=soft_factors)
+                # 低分消息不立即触发，等静默窗口兜底
 
             # 4. 重置静默定时器（无论硬软，新消息都推迟兜底触发）
             self._reschedule_quiet_trigger(ctx)
@@ -384,22 +394,30 @@ class Bot:
                 return True
             return False
 
-    def _try_trigger_immediate(self, ctx: GroupContext, hard: bool = False, soft_factors=None):
-        """立即尝试触发 LLM（硬因子或软因子路径）。
+    def _try_trigger_immediate(self, ctx: GroupContext, hard: bool = False, soft_factors=None, direct: bool = False):
+        """立即尝试触发 LLM（硬因子 / direct 快速 / 软因子路径）。
 
         冷却检查：距上次回复 < cooldown 则跳过（让静默窗口兜底）。
         cycle 串行检查：撞 _cycle_running 则注册重试，cycle 完成后立即重跑。
 
         Args:
             ctx: 群上下文（per-group 冷却时间和 _cycle_pending）
-            hard: True=硬因子触发（@/提问），False=软因子触发（评分过阈值）
+            hard: True=硬因子触发（@/提问），False=非硬因子
             soft_factors: 软因子触发时传入命中的软因子列表，供归因使用；
-                         硬因子触发传 None，归因跳过。
+                         硬因子/direct 触发传 None，归因跳过。
+            direct: True=direct 快速触发（阶段 F，绕过 peek_threshold，归因跳过）
         """
         now = time.time()
         elapsed = now - ctx.last_reply_time
-        cooldown = HARD_COOLDOWN_SECONDS if hard else SOFT_COOLDOWN_MIN
-        trigger_label = "硬因子" if hard else "软因子"
+        if direct:
+            cooldown = SOFT_COOLDOWN_MIN
+            trigger_label = "direct快速"
+        elif hard:
+            cooldown = HARD_COOLDOWN_SECONDS
+            trigger_label = "硬因子"
+        else:
+            cooldown = SOFT_COOLDOWN_MIN
+            trigger_label = "软因子"
         if elapsed < cooldown:
             logger.debug(f"{trigger_label}触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），等静默窗口兜底")
             return
@@ -590,6 +608,9 @@ class Bot:
             if soft_factors is not None:
                 ctx.attribution.update(soft_factors, "silent")
             self.affinity.apply_delta(parsed.affinity_delta)
+            # 阶段 F：silent 保留 direct 状态（不清空 direct_targets）
+            # 只顺手清理过期 target
+            self._cleanup_expired_direct_targets(ctx)
             return
 
         if parsed.action == "react":
@@ -604,6 +625,8 @@ class Bot:
             if soft_factors is not None:
                 ctx.attribution.update(soft_factors, "react")
             self.affinity.apply_delta(parsed.affinity_delta)
+            # 阶段 F：react 保留 direct 状态（同 silent），清理过期 target
+            self._cleanup_expired_direct_targets(ctx)
             return
 
         # reply / multi_reply
@@ -618,6 +641,95 @@ class Bot:
         # 归因更新（主动触发时 soft_factors=None，跳过）
         if soft_factors is not None:
             ctx.attribution.update(soft_factors, parsed.action)
+
+        # 阶段 F：根据 LLM 输出更新 direct 状态
+        # - conversation_mode=direct + targets 至少一个可解析 → 为每个 target 设置 deadline
+        # - conversation_mode=open 或 targets 全部不可解析 → 清空 direct_targets
+        # - silent/react 已在上面处理（保留 direct 状态）
+        self._update_direct_state(ctx, parsed)
+
+    def _update_direct_state(self, ctx: GroupContext, parsed):
+        """阶段 F：根据 LLM 输出更新 direct 状态。
+
+        仅在 action=reply/multi_reply 时调用（silent/react 在 _handle_result 中已处理）。
+
+        - conversation_mode=direct + targets 至少一个可解析 QQ：
+          对每个有效 target 设置 deadline = last_reply_time + DIRECT_WINDOW_SECONDS
+          （保留字典中其他未过期 target，不清空已有）
+        - conversation_mode=open 或 targets 全部不可解析：
+          清空 direct_targets 字典，conversation_mode 回落 open
+        """
+        # 顺手清理过期 target
+        self._cleanup_expired_direct_targets(ctx)
+
+        if parsed.conversation_mode != "direct":
+            # LLM 主动输出 open，退出 direct
+            if ctx.direct_targets:
+                logger.info(f"LLM 输出 conversation_mode=open，清空 direct_targets（{len(ctx.direct_targets)} 个）")
+                ctx.direct_targets.clear()
+            ctx.conversation_mode = "open"
+            return
+
+        # conversation_mode=direct，解析 targets 为 QQ 列表
+        valid_qqs = self._resolve_targets(ctx, parsed.targets)
+        if not valid_qqs:
+            # targets 全部不可解析，强制 open（无有效对话对象）
+            logger.info("conversation_mode=direct 但 targets 无可解析 QQ，强制 open")
+            ctx.direct_targets.clear()
+            ctx.conversation_mode = "open"
+            return
+
+        # 为每个有效 target 设置 deadline（保留字典中其他未过期 target）
+        # 窗口起点用 last_reply_time（Bot 最后一条消息实际发送完成的时间戳），
+        # 而非代码处理时间——避免绘图/媒体下载等慢发送压缩窗口
+        deadline = ctx.last_reply_time + DIRECT_WINDOW_SECONDS
+        for qq in valid_qqs:
+            ctx.direct_targets[qq] = deadline
+        ctx.conversation_mode = "direct"
+        logger.info(f"更新 direct 状态：targets={list(ctx.direct_targets.keys())} "
+                    f"deadline={deadline:.1f}（{DIRECT_WINDOW_SECONDS}s 窗口）")
+
+    def _resolve_targets(self, ctx: GroupContext, targets: list) -> list:
+        """解析 targets 字段为 QQ 列表。
+
+        - 纯数字 → QQ 号
+        - 非数字 → 成员表反查昵称→QQ（card 或 nickname 匹配）
+        - 反查失败 → 跳过该元素
+
+        Returns:
+            有效 QQ 字符串列表
+        """
+        valid_qqs = []
+        group_members = self.napcat.member_cache.get(ctx.group_id, {})
+        for t in targets:
+            t_str = str(t).strip()
+            if not t_str:
+                continue
+            if t_str.isdigit():
+                valid_qqs.append(t_str)
+                continue
+            # 昵称反查：card 优先于 nickname
+            for qq, info in group_members.items():
+                nick = info.get("card") or info.get("nickname") or ""
+                if nick == t_str:
+                    valid_qqs.append(qq)
+                    break
+        return valid_qqs
+
+    def _cleanup_expired_direct_targets(self, ctx: GroupContext):
+        """清理 direct_targets 字典中已过期的 target。
+
+        若清理后字典为空，conversation_mode 自动回落 open。
+        """
+        now = time.time()
+        expired = [qq for qq, deadline in ctx.direct_targets.items() if deadline <= now]
+        for qq in expired:
+            del ctx.direct_targets[qq]
+        if expired:
+            logger.debug(f"清理 {len(expired)} 个过期 direct target: {expired}")
+        if not ctx.direct_targets and ctx.conversation_mode == "direct":
+            ctx.conversation_mode = "open"
+            logger.debug("direct_targets 全部过期，conversation_mode 回落 open")
 
     def _send_messages(self, ctx: GroupContext, messages: list):
         """发送消息列表，带间隔。
