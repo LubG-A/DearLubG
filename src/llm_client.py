@@ -17,7 +17,7 @@ class LLMClient:
     messages = [
         {"role": "system", "content": "人格+协议+早期摘要"},
         {"role": "user", "content": "群消息批次1"},
-        {"role": "assistant", "content": "LLM 返回的完整 JSON（含 thought，无论 silent 还是 reply）"},
+        {"role": "assistant", "content": "LLM 返回的完整 JSON（含 state，无论 silent 还是 reply）"},
         {"role": "user", "content": "群消息批次2"},
         {"role": "assistant", "content": "..."},
         ...

@@ -13,12 +13,15 @@ logger = get_logger("parser")
 VALID_ACTIONS = {"silent", "reply", "react", "multi_reply"}
 VALID_MSG_TYPES = {"text", "at", "reply", "face", "image", "voice", "video", "forward"}
 VALID_CONVERSATION_MODES = {"direct", "open"}
+# 阶段 G：结构化内心状态的固定维度（全部 clip 到 [0,1]）
+STATE_DIMS = ("interest", "annoyance", "empathy", "urge_to_speak", "social_risk", "energy")
+VALID_STATE_MODES = {"旁观", "接话", "吐槽", "补刀", "主动开口"}
 
 
 @dataclass
 class ParsedResult:
     """解析后的结果。"""
-    thought: str = ""
+    state: dict = field(default_factory=dict)  # 阶段 G：结构化内心状态（仅观测/记忆，不参与决策）
     action: str = "silent"
     targets: list = field(default_factory=list)
     messages: list = field(default_factory=list)
@@ -156,8 +159,12 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
         logger.warning(f"非法 conversation_mode={conversation_mode}，降级为 open")
         conversation_mode = "open"
 
+    # 阶段 G：结构化内心状态。仅用于日志观测与后续轮次的自我记忆，
+    # 任何字段非法都降级为默认值，绝不影响 action 判定（不 fallback silent）。
+    state = _parse_state(data.get("state"))
+
     return ParsedResult(
-        thought=data.get("thought", ""),
+        state=state,
         action=action,
         targets=data.get("targets", []),
         messages=cleaned_messages,
@@ -200,3 +207,68 @@ def _validate_segment(seg) -> Optional[dict]:
         data_dict["target_msg_id"] = target_id
         seg["data"] = data_dict
     return seg
+
+
+def _parse_state(raw_state) -> dict:
+    """解析并规整结构化内心状态（阶段 G）。
+
+    state 只用于日志观测和后续轮次的自我记忆，不参与本轮发送决策。
+    因此所有字段非法时都降级为默认值，绝不因此 fallback silent。
+
+    Returns:
+        规整后的 state dict；raw_state 缺失或非 dict 时返回空 dict
+    """
+    if not isinstance(raw_state, dict):
+        if raw_state is not None:
+            logger.warning(f"state 非 dict，忽略: {type(raw_state)}")
+        return {}
+
+    dims_raw = raw_state.get("dims", {})
+    if not isinstance(dims_raw, dict):
+        dims_raw = {}
+    dims = {}
+    for key in STATE_DIMS:
+        val = dims_raw.get(key)
+        # bool 是 int 的子类，需排除
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            dims[key] = round(max(0.0, min(1.0, float(val))), 2)
+        else:
+            dims[key] = 0.5  # 缺失/非法维度按中性值补齐
+
+    def _str_list(value, limit: int) -> list:
+        if not isinstance(value, list):
+            return []
+        items = [str(x).strip() for x in value
+                 if isinstance(x, (str, int, float)) and not isinstance(x, bool)]
+        return [i for i in items if i][:limit]
+
+    activated = []
+    activated_raw = raw_state.get("activated", [])
+    if isinstance(activated_raw, list):
+        for item in activated_raw[:3]:
+            if not isinstance(item, dict):
+                continue
+            rule = str(item.get("rule", "")).strip()
+            if not rule:
+                continue
+            strength = item.get("strength", 0.5)
+            if not isinstance(strength, (int, float)) or isinstance(strength, bool):
+                strength = 0.5
+            activated.append({
+                "rule": rule,
+                "strength": round(max(0.0, min(1.0, float(strength))), 2),
+            })
+
+    mode = str(raw_state.get("mode", "")).strip()
+    if mode not in VALID_STATE_MODES:
+        mode = ""
+
+    return {
+        "salient_cues": _str_list(raw_state.get("salient_cues"), 3),
+        "activated": activated,
+        "dims": dims,
+        "speak_drivers": _str_list(raw_state.get("speak_drivers"), 2),
+        "speak_inhibitors": _str_list(raw_state.get("speak_inhibitors"), 2),
+        "mode": mode,
+        "note": str(raw_state.get("note", "")).strip()[:60],
+    }

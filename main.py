@@ -553,7 +553,7 @@ class Bot:
 
             # 6. 解析 + 落地
             parsed = parse_and_validate(raw_result)
-            logger.info(f"LLM 返回 action={parsed.action} thought={parsed.thought[:50]}"
+            logger.info(f"LLM 返回 action={parsed.action} state={_format_state(parsed.state)}"
                         f"{' reply_delay=' + str(parsed.reply_delay_minutes) + 'min' if parsed.reply_delay_minutes > 0 else ''}"
                         f"{' [主动触发]' if is_active else ''}")
 
@@ -844,6 +844,27 @@ def _extract_text_from_msg(msg: dict) -> str:
         if seg.get("type") == "text":
             parts.append(seg.get("data", {}).get("text", ""))
     return "".join(parts)
+
+
+# 阶段 G：内心状态维度的日志缩写
+_STATE_ABBR = {
+    "interest": "int",
+    "annoyance": "ann",
+    "empathy": "emp",
+    "urge_to_speak": "urge",
+    "social_risk": "risk",
+    "energy": "eng",
+}
+
+
+def _format_state(state: dict) -> str:
+    """把结构化内心状态压成一行日志（阶段 G，用于观测维度分布）。"""
+    if not state:
+        return "无"
+    dims = state.get("dims", {})
+    dim_str = " ".join(f"{abbr}={dims.get(key, 0.5)}" for key, abbr in _STATE_ABBR.items())
+    mode = state.get("mode") or "无"
+    return f"mode={mode} {dim_str} note={state.get('note', '')}"
 
 
 def _msg_to_text(msg) -> str:

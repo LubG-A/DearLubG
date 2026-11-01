@@ -2,7 +2,7 @@
 
 存储结构：messages 列表，严格 user/assistant 交替。
 - user：每轮"看一眼"触发时的群消息批次
-- assistant：LLM 返回的完整 JSON（含 thought，无论 action 是什么）
+- assistant：LLM 返回的完整 JSON（含 state 内心状态，无论 action 是什么）
 
 每轮 LLM 调用必有 assistant 落地，silent 也是真实回复。
 超过阈值时对早期 user/assistant 对做分层压缩（方案A）：
