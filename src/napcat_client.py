@@ -94,6 +94,17 @@ class NapCatClient:
             "user_id": user_id,
         }).get("data", {})
 
+    def get_msg(self, message_id: str, quiet: bool = True) -> dict:
+        """根据消息 ID 获取消息详情（/get_msg）。
+
+        用于补全引用消息的原文与图片。quiet=True：被引用消息可能已过期/被撤回，
+        查询失败只记 INFO，不刷 ERROR；调用方拿空 dict 走占位回退。
+        """
+        if not message_id:
+            return {}
+        resp = self._call("get_msg", {"message_id": str(message_id)}, quiet=quiet, timeout=5)
+        return resp.get("data") or {}
+
     def send_group_msg(self, group_id: str, message: list, timeout: int = 30) -> dict:
         """发送群消息（消息段数组形式）。
 
@@ -197,17 +208,18 @@ class NapCatClient:
         data = resp.get("data")
         return data if isinstance(data, str) else ""
 
-    def fetch_ptt_text(self, message_id: str, quiet: bool = False) -> str:
+    def fetch_ptt_text(self, message_id: str, quiet: bool = False, timeout: int = 10) -> str:
         """获取语音转文字结果（/fetch_ptt_text）。
 
         Args:
             message_id: 语音消息的 message_id
             quiet: True 时业务失败记 INFO（语音转写重试场景），否则记 ERROR。
+            timeout: HTTP 超时（秒）。被引用语音补全时传更小值，避免阻塞接收线程。
 
         Returns:
             转写的文字；失败（含权限不足、非语音消息、NapCat 不支持）返回空串。
         """
-        resp = self._call("fetch_ptt_text", {"message_id": message_id}, quiet=quiet)
+        resp = self._call("fetch_ptt_text", {"message_id": message_id}, quiet=quiet, timeout=timeout)
         if not resp:
             return ""
         data = resp.get("data") or {}

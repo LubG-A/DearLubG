@@ -78,6 +78,19 @@ class PrivateConfig:
 
 
 @dataclass
+class VisionConfig:
+    """识图配置（DeepSeek 多模态图片输入）。
+
+    DeepSeek 支持 JPEG/PNG/GIF/WebP，图片只能放在 user 消息中。
+    本框架将当前批次图片转成 base64 data URL 后插入 user content。
+    """
+    enabled: bool = True
+    max_images_per_turn: int = 6      # 单轮最多送几张图（DeepSeek 上限 600，这里控成本）
+    max_side: int = 1280              # 图片最长边，超过则等比缩小（DeepSeek 会自动缩到约 1300）
+    detail: str = "auto"              # low / high / original / auto
+
+
+@dataclass
 class Config:
     napcat: NapCatConfig
     llm: LLMConfig
@@ -89,6 +102,7 @@ class Config:
     active_trigger: ActiveTriggerConfig = None  # 主动触发配置
     media_download: MediaDownloadConfig = None  # 媒体下载配置
     private: PrivateConfig = None                # 私聊配置
+    vision: VisionConfig = None                  # 识图配置
 
 
 def load_config(path: str = "config.yaml") -> Config:
@@ -119,6 +133,17 @@ def load_config(path: str = "config.yaml") -> Config:
         cooldown_seconds=private_raw.get("cooldown_seconds", 3),
     )
 
+    vision_raw = raw.get("vision", {})
+    detail = vision_raw.get("detail", "auto")
+    if detail not in ("low", "high", "original", "auto"):
+        detail = "auto"
+    vision = VisionConfig(
+        enabled=vision_raw.get("enabled", True),
+        max_images_per_turn=vision_raw.get("max_images_per_turn", 6),
+        max_side=vision_raw.get("max_side", 1280),
+        detail=detail,
+    )
+
     return Config(
         napcat=NapCatConfig(
             base_url=raw["napcat"]["base_url"],
@@ -133,4 +158,5 @@ def load_config(path: str = "config.yaml") -> Config:
         active_trigger=active,
         media_download=media_download,
         private=private,
+        vision=vision,
     )

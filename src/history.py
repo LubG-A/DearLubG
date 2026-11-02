@@ -126,7 +126,8 @@ class HistoryManager:
         tmp.replace(self.file)  # 原子操作（同文件系统内）
 
     # ---------- 群消息追加（入 fast_buffer，接收线程 / LLM 线程均调用） ----------
-    def append_group_message(self, qq: str, nickname: str, content: str, msg_id: str, is_bot: bool = False):
+    def append_group_message(self, qq: str, nickname: str, content: str, msg_id: str,
+                             is_bot: bool = False, images: Optional[list[dict]] = None):
         """追加群消息到 fast_buffer（接收线程与 LLM 线程共用入口）。
 
         只加 _buffer_lock，持锁时间极短（仅 list.append）。
@@ -135,6 +136,10 @@ class HistoryManager:
         bot 自身回复（is_bot=True）也走此入口，由 LLM 工作线程在发送后调用，
         与群成员消息按真实 append 顺序混合在 fast_buffer 中，下一轮 drain 时
         一起进入 pending，保证 LLM 看到的发言顺序 = 真实群聊发言顺序。
+
+        Args:
+            images: 图片源列表（NapCat image 段 data），供本轮识图使用；
+                    只随当前 pending 批次进入 LLM 请求，历史 messages 只保留文本标记。
         """
         entry = {
             "time": datetime.now().strftime("%H:%M:%S"),
@@ -143,6 +148,7 @@ class HistoryManager:
             "content": content,
             "is_bot": is_bot,
             "msg_id": msg_id,
+            "images": list(images) if images else [],
         }
         with self._buffer_lock:
             self.fast_buffer.append(entry)
@@ -155,6 +161,21 @@ class HistoryManager:
         """
         with self._buffer_lock:
             return any(not m.get("is_bot") for m in self.fast_buffer)
+
+    def collect_pending_images(self) -> list[dict]:
+        """收集当前 pending 批次中的图片源（按消息顺序，忽略 bot 消息）。
+
+        仅用于本轮 LLM 请求；历史 messages 只存文本（含 [图片] 标记），
+        避免每轮重复发送 base64 图片导致请求体/token 膨胀。
+        """
+        images = []
+        for m in self.pending_group_msgs:
+            if m.get("is_bot"):
+                continue
+            for src in m.get("images", []):
+                if isinstance(src, dict):
+                    images.append(src)
+        return images
 
     def drain_buffer_to_pending(self) -> int:
         """把 fast_buffer 原子地移到 pending（LLM 工作线程调用）。

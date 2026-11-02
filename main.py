@@ -50,6 +50,7 @@ SOFT_COOLDOWN_MIN = 5         # 软因子触发冷却下限
 SOFT_COOLDOWN_MAX = 60         # 软因子触发冷却上限
 QUIET_WINDOW_SECONDS = 150       # 静默窗口：N 秒无新消息后兜底触发
 DIRECT_WINDOW_SECONDS = 90      # 阶段 F：direct 模式活跃窗口，target 在此窗口内发言触发快速触发
+QUOTED_MESSAGE_MAX_CHARS = 500  # 引用消息原文最大字符数，避免上下文膨胀
 
 
 class Bot:
@@ -271,17 +272,16 @@ class Bot:
 
             sender = msg.get("sender") or {}
             sender_nick = sender.get("nickname") or msg.get("nickname") or user_qq
-            content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
+            content, images, has_voice = self._extract_incoming_content(msg)
             msg_id = str(msg.get("message_id", ""))
 
-            has_voice = self._has_voice_segment(msg)
             if has_voice:
                 content = (content + (" " if content else "") + "[语音消息]").strip()
 
             ctx = self._get_or_create_private_ctx(user_qq, sender_nick)
 
             # 入 fast_buffer（与 bot 回复共用入口，保持真实发言顺序）
-            ctx.history.append_group_message(user_qq, sender_nick, content, msg_id)
+            ctx.history.append_group_message(user_qq, sender_nick, content, msg_id, images=images)
 
             # 语音转写：异步延迟重试，成功后回填历史 content
             if has_voice and msg_id:
@@ -355,17 +355,16 @@ class Bot:
 
             sender_qq = str(msg.get("user_id", ""))
             sender_nick = self.napcat.get_nickname(msg_group_id, sender_qq)
-            content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
+            content, images, has_voice = self._extract_incoming_content(msg)
             msg_id = str(msg.get("message_id", ""))
 
             # 语音消息：先用占位入历史（不阻塞），独立线程延迟重试转写后回填
             # NapCat 收到语音需先从腾讯下载 amr 文件，立即调用 fetch_ptt_text 会因文件未就绪而失败
-            has_voice = self._has_voice_segment(msg)
             if has_voice:
                 content = (content + (" " if content else "") + "[语音消息]").strip()
 
             # 1. 入 fast_buffer（无 _cycle_lock，仅 HistoryManager 内 _buffer_lock）
-            ctx.history.append_group_message(sender_qq, sender_nick, content, msg_id)
+            ctx.history.append_group_message(sender_qq, sender_nick, content, msg_id, images=images)
 
             # 语音转写：异步延迟重试，成功后回填历史 content
             if has_voice and msg_id:
@@ -398,9 +397,163 @@ class Bot:
         except Exception as e:
             logger.error(f"处理消息异常: {e}", exc_info=True)
 
-    def _has_voice_segment(self, msg: dict) -> bool:
-        """消息是否含语音段（record）。"""
-        return any(seg.get("type") == "record" for seg in msg.get("message", []))
+    def _extract_incoming_content(self, msg: dict) -> tuple[str, list[dict], bool]:
+        """提取消息文本、图片源与语音标记。
+
+        含图片或引用时从消息段重建文本：
+        - 图片替换为 [图片] 标记，同时收集 image 段 data 供本轮识图使用
+        - 引用段调用 /get_msg 补全被引用消息的原文与图片，嵌入 [引用 昵称(QQ): 原文]
+        不含图片也不含引用时沿用 raw_message，保持原有行为。
+
+        Returns:
+            (content, images, has_voice)
+        """
+        segments = msg.get("message") or []
+        has_image = any(isinstance(seg, dict) and seg.get("type") == "image" for seg in segments)
+        has_reply = any(isinstance(seg, dict) and seg.get("type") == "reply" for seg in segments)
+        has_voice = any(isinstance(seg, dict) and seg.get("type") == "record" for seg in segments)
+
+        if not has_image and not has_reply:
+            content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
+            return content, [], has_voice
+
+        parts = []
+        images = []
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            t = seg.get("type", "")
+            data = seg.get("data", {}) or {}
+            if t == "text":
+                parts.append(data.get("text", ""))
+            elif t == "image":
+                parts.append("[图片]")
+                images.append(data)
+            elif t == "record":
+                # 语音占位由调用方统一追加，避免重复
+                continue
+            elif t == "at":
+                parts.append(f"@{data.get('qq', '')}")
+            elif t == "face":
+                parts.append("[表情]")
+            elif t == "reply":
+                quoted = self._fetch_quoted_message(data)
+                if quoted:
+                    qtext, qimages = self._format_quoted_message(quoted)
+                    parts.append(f"[{qtext}]" if qtext else "[引用]")
+                    images.extend(qimages)
+                else:
+                    parts.append("[引用]")
+            elif t == "forward":
+                parts.append("[合并转发]")
+            elif t == "file":
+                parts.append("[文件]")
+            else:
+                parts.append(f"[{t}]")
+
+        content = "".join(parts).strip()
+        if not content:
+            content = "[图片]" if images else (msg.get("raw_message", "") or "")
+        return content, images, has_voice
+
+    def _fetch_quoted_message(self, reply_data: dict) -> dict:
+        """通过 /get_msg 获取被引用消息详情。失败/过期返回空 dict。"""
+        msg_id = str(
+            reply_data.get("id")
+            or reply_data.get("message_id")
+            or reply_data.get("target_msg_id")
+            or ""
+        )
+        if not msg_id:
+            return {}
+        quoted = self.napcat.get_msg(msg_id, quiet=True)
+        if quoted:
+            logger.debug(f"引用消息补全成功: quoted_msg_id={msg_id}")
+        else:
+            logger.info(f"引用消息补全失败/已过期: quoted_msg_id={msg_id}")
+        return quoted
+
+    def _format_quoted_message(self, quoted: dict) -> tuple[str, list[dict]]:
+        """把被引用消息格式化为一行文本，并返回其中的图片源。"""
+        sender = quoted.get("sender") or {}
+        nick = (
+            sender.get("card")
+            or sender.get("nickname")
+            or quoted.get("nickname")
+            or str(quoted.get("user_id", ""))
+            or "某人"
+        )
+        qq = str(sender.get("user_id") or quoted.get("user_id") or "")
+
+        raw = quoted.get("message")
+        if isinstance(raw, dict):
+            raw = [raw]
+        images = []
+        voice_text = None
+        if isinstance(raw, list):
+            parts = []
+            for seg in raw:
+                if not isinstance(seg, dict):
+                    continue
+                t = seg.get("type", "")
+                data = seg.get("data", {}) or {}
+                if t == "text":
+                    parts.append(data.get("text", ""))
+                elif t == "image":
+                    parts.append("[图片]")
+                    images.append(data)
+                elif t == "at":
+                    parts.append(f"@{data.get('qq', '')}")
+                elif t == "face":
+                    parts.append("[表情]")
+                elif t == "reply":
+                    parts.append("[引用]")
+                elif t == "forward":
+                    parts.append("[合并转发]")
+                elif t == "record":
+                    if voice_text is None:
+                        voice_text = self._fetch_quoted_voice_text(quoted)
+                    parts.append(f"[语音] {voice_text}" if voice_text else "[语音]")
+                elif t == "file":
+                    parts.append("[文件]")
+                else:
+                    parts.append(f"[{t}]")
+            text = "".join(parts)
+        else:
+            text = str(raw or quoted.get("raw_message", ""))
+
+        # 压缩换行/多余空白，截断避免上下文膨胀
+        text = " ".join(text.split())
+        if len(text) > QUOTED_MESSAGE_MAX_CHARS:
+            text = text[:QUOTED_MESSAGE_MAX_CHARS] + "…"
+        if not text:
+            text = "[图片]" if images else "[空]"
+
+        prefix = f"引用 {nick}({qq}): " if qq else f"引用 {nick}: "
+        return prefix + text, images
+
+    def _fetch_quoted_voice_text(self, quoted: dict) -> str:
+        """转写被引用消息中的语音（/fetch_ptt_text）。
+
+        被引用语音通常已存在一段时间，文件大概率已就绪；这里做一次立即尝试 +
+        一次 1 秒后的轻量重试，查询失败回退为 [语音] 占位，不阻塞太久。
+        """
+        msg_id = str(quoted.get("message_id") or quoted.get("real_id") or "")
+        if not msg_id:
+            return ""
+        for attempt in range(2):
+            if attempt:
+                time.sleep(1.0)
+            try:
+                text = self.napcat.fetch_ptt_text(msg_id, quiet=True, timeout=5)
+            except Exception as e:
+                logger.debug(f"引用语音转写尝试异常: quoted_msg_id={msg_id} {e}")
+                text = ""
+            if text:
+                logger.info(f"引用语音转写成功: quoted_msg_id={msg_id} text={text[:30]}")
+                return text
+        logger.info(f"引用语音转写失败/未就绪: quoted_msg_id={msg_id}")
+        return ""
 
     def _transcribe_voice_async(self, ctx: ChatContext, msg_id: str):
         """异步转写语音：分级延迟重试，成功后回填历史 content。
@@ -737,7 +890,13 @@ class Bot:
             )
 
             # 5. 调用 LLM（不持锁，_cycle_running 标志保证串行）
-            raw_result = self.llm.chat(system_prompt, history_messages, new_user_content)
+            #    图片源来自当前 pending 批次；只在本次 user content 中附带，不进历史消息
+            pending_images = ctx.history.collect_pending_images()
+            if pending_images:
+                logger.info(f"{ctx.chat_key} 本轮携带 {len(pending_images)} 张图片进入识图")
+            raw_result = self.llm.chat(
+                system_prompt, history_messages, new_user_content, images=pending_images
+            )
             if raw_result is None:
                 logger.warning("LLM 调用失败，本轮跳过")
                 # pending 留待下次触发再拼入（消息不丢失）
