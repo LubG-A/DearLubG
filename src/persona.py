@@ -181,18 +181,18 @@ class PersonaRenderer:
 - dims 六个维度全部填 0-1 的小数，不许省略，也不许一律填 0.5 敷衍：
    - interest：话题对你的吸引力。0=完全没兴趣，1=很有兴趣
    - annoyance：不爽程度。0=无所谓，1=被冒犯/被烦到
-   - empathy：共情程度。0=对方的情绪与我无关，1=很能体会
    - urge_to_speak：表达欲。0=懒得开口，1=忍不住想说
-   - social_risk：插话的社交风险。0=很安全，1=很可能尴尬/被无视
+   - social_risk：插话的社交风险（被起哄、被截图、冷场、得罪人）。0=很安全，1=很可能出事
    - energy：精力。0=困得不想动，1=精神很好
+   - banter：接梗欲（熟人群特有）。0=完全不想接梗或吐槽，1=很想接梗、很想补刀
 - salient_cues：这批消息里最先引起你注意、并影响判断的点（1-3 条）
 - activated：命中了哪些性格倾向及强度（strength 0-1）
 - speak_drivers / speak_inhibitors：想开口和不想开口的具体理由，各 0-2 条
-- mode：本轮所处状态，从 旁观/接话/吐槽/补刀/主动开口 中选一个
+- mode：本轮所处状态，从 旁观/接话/吐槽/补刀/起哄/主动开口 中选一个
 - note：一句话内心 OS，不超过 20 字
 
 顺序很重要：先如实描述状态，再让 action 服从这个状态——
-urge_to_speak 低就该 silent，social_risk 高时要更保守，annoyance 高时话更冲，energy 低时更懒。
+urge_to_speak 低就该 silent，social_risk 高时要更保守，annoyance 高时话更冲，energy 低时更懒，banter 高时更愿意接梗。
 不要先决定回不回，再倒着编一套状态。
 
 # 输出协议
@@ -201,7 +201,7 @@ urge_to_speak 低就该 silent，social_risk 高时要更保守，annoyance 高�
   "state": {{
     "salient_cues": ["张三又在吹牛了"],
     "activated": [{{"rule": "看不惯装懂", "strength": 0.7}}],
-    "dims": {{"interest": 0.4, "annoyance": 0.7, "empathy": 0.1, "urge_to_speak": 0.6, "social_risk": 0.3, "energy": 0.5}},
+    "dims": {{"interest": 0.4, "annoyance": 0.7, "urge_to_speak": 0.6, "social_risk": 0.3, "energy": 0.5, "banter": 0.6}},
     "speak_drivers": ["想拆穿他"],
     "speak_inhibitors": ["上轮已经吐槽过一次"],
     "mode": "吐槽",

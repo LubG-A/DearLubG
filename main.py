@@ -850,10 +850,10 @@ def _extract_text_from_msg(msg: dict) -> str:
 _STATE_ABBR = {
     "interest": "int",
     "annoyance": "ann",
-    "empathy": "emp",
     "urge_to_speak": "urge",
     "social_risk": "risk",
     "energy": "eng",
+    "banter": "ban",
 }
 
 

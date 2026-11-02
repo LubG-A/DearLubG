@@ -14,8 +14,9 @@ VALID_ACTIONS = {"silent", "reply", "react", "multi_reply"}
 VALID_MSG_TYPES = {"text", "at", "reply", "face", "image", "voice", "video", "forward"}
 VALID_CONVERSATION_MODES = {"direct", "open"}
 # 阶段 G：结构化内心状态的固定维度（全部 clip 到 [0,1]）
-STATE_DIMS = ("interest", "annoyance", "empathy", "urge_to_speak", "social_risk", "energy")
-VALID_STATE_MODES = {"旁观", "接话", "吐槽", "补刀", "主动开口"}
+# banter（接梗欲）替换 empathy（共情），更贴合熟人群语境
+STATE_DIMS = ("interest", "annoyance", "urge_to_speak", "social_risk", "energy", "banter")
+VALID_STATE_MODES = {"旁观", "接话", "吐槽", "补刀", "起哄", "主动开口"}
 
 
 @dataclass
