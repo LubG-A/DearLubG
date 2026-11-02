@@ -1,10 +1,16 @@
 """QQ 群聊/私聊机器人主入口。
 
 流程：
-- 群聊被动触发：群消息 -> 入 fast_buffer -> 评分 -> 触发决策（硬因子短冷却立即 / direct 快速 / 软因子 / 静默窗口兜底）
-- 私聊触发：白名单私聊消息 -> 入 fast_buffer -> 立即触发（仅冷却 + P003 补触发，无评分/归因）
+- 群聊被动触发：群消息 -> 入 fast_buffer -> 评分 -> 触发决策（硬因子短冷却立即 / direct 倒计时 / 软因子 / 静默窗口兜底）
+- 私聊触发：白名单私聊消息 -> 入 fast_buffer -> direct 回复倒计时（仅冷却，无评分/归因）
 - 主动触发：定时器唤醒 -> LLM 调用（无新消息，让 LLM 自主决定要不要主动开口）
 - 延迟回复：LLM 输出 reply_delay_minutes -> 消息暂存 -> 下次触发时重新加入 pending
+
+同时发言（P003 v2.4）：
+- Bot 的 LLM 调用/发送期间到达的消息，在 ctx 上打标记（_backlog_pending）
+- 本轮结束若已进入 direct（或私聊），武装回复倒计时：target 停口 N 秒后才回
+- 倒计时期间 target 每有新的发言就重置，最多重置 DIRECT_COUNTDOWN_MAX_RESETS 次
+- 目的：把用户连发合并成一次回复，而不是"一条一回"
 
 并发模型（B2 方案）：
 - 接收线程（webhook）只写 fast_buffer（HistoryManager 内 _buffer_lock 保护，持锁极短）
@@ -50,6 +56,8 @@ SOFT_COOLDOWN_MIN = 5         # 软因子触发冷却下限
 SOFT_COOLDOWN_MAX = 60         # 软因子触发冷却上限
 QUIET_WINDOW_SECONDS = 150       # 静默窗口：N 秒无新消息后兜底触发
 DIRECT_WINDOW_SECONDS = 90      # 阶段 F：direct 模式活跃窗口，target 在此窗口内发言触发快速触发
+DIRECT_REPLY_COUNTDOWN_SECONDS = 9  # P003 v2.4：direct 回复倒计时，target 停口 N 秒后才回
+DIRECT_COUNTDOWN_MAX_RESETS = 9      # P003 v2.4：倒计时最多被 target 新发言重置的次数
 QUOTED_MESSAGE_MAX_CHARS = 500  # 引用消息原文最大字符数，避免上下文膨胀
 
 
@@ -262,8 +270,9 @@ class Bot:
         """处理收到的私聊消息（接收线程）。
 
         私聊是群聊的减法：不评分、不归因、不设静默窗口。
-        每条消息立即尝试触发；若 Bot 正在 LLM 调用/发送，新消息进 fast_buffer，
-        本轮结束后由 P003 补触发机制在冷却结束时再看一眼。
+        对方每发一条消息就武装/重置 direct 回复倒计时（停口 5s 后才回，连发合并）；
+        若 Bot 正在 LLM 调用/发送，新消息进 fast_buffer 并打 _backlog_pending 标记，
+        本轮结束后由倒计时合并补看一眼。
         """
         try:
             user_qq = str(msg.get("user_id", ""))
@@ -282,12 +291,16 @@ class Bot:
 
             # 入 fast_buffer（与 bot 回复共用入口，保持真实发言顺序）
             ctx.history.append_group_message(user_qq, sender_nick, content, msg_id, images=images)
+            # P003 v2.4：私聊 cycle 正在跑 -> 打标记
+            if ctx._cycle_active:
+                ctx._backlog_pending = True
 
             # 语音转写：异步延迟重试，成功后回填历史 content
             if has_voice and msg_id:
                 threading.Thread(target=self._transcribe_voice_async, args=(ctx, msg_id), daemon=True).start()
 
-            self._try_trigger_private(ctx)
+            # 私聊是 1v1：所有对方发言都走 direct 回复倒计时（停口后再回，合并连发）
+            self._maybe_arm_direct_countdown(ctx, new_speech=True)
         except Exception as e:
             logger.error(f"处理私聊消息异常: {e}", exc_info=True)
 
@@ -365,6 +378,9 @@ class Bot:
 
             # 1. 入 fast_buffer（无 _cycle_lock，仅 HistoryManager 内 _buffer_lock）
             ctx.history.append_group_message(sender_qq, sender_nick, content, msg_id, images=images)
+            # P003 v2.4：本群 cycle 正在跑 -> 这条消息是"Bot 输出期间到达的欠账"，先打标记
+            if ctx._cycle_active:
+                ctx._backlog_pending = True
 
             # 语音转写：异步延迟重试，成功后回填历史 content
             if has_voice and msg_id:
@@ -375,18 +391,18 @@ class Bot:
             is_hard = self._is_hard_trigger(ctx, msg, content)
             logger.debug(f"消息评分={score} hard={is_hard} soft_factors={[f.name for f in soft_factors]}")
 
-            # 3. 触发决策（按优先级：硬因子 > direct 快速触发 > 软因子 > 静默兜底）
+            # 3. 触发决策（按优先级：硬因子 > direct 倒计时 > 软因子 > 静默兜底）
             if is_hard:
                 self._try_trigger_immediate(ctx, hard=True)
             else:
-                # 阶段 F：direct 快速触发——发送者在 direct_targets 字典中且未过该 target 的 deadline
-                # 绕过 peek_threshold，直接让 LLM 看一眼（LLM 仍决定 silent/reply）
+                # 阶段 F：direct 目标的发言。P003 v2.4 起不再立即触发，改为武装/重置回复倒计时，
+                # 等 target 停口后再回（避免用户连发时一条一回）
                 now_ts = time.time()
                 direct_deadline = ctx.direct_targets.get(sender_qq)
                 if direct_deadline is not None and direct_deadline > now_ts:
                     # 续命：重置该 target 的 deadline
                     ctx.direct_targets[sender_qq] = now_ts + DIRECT_WINDOW_SECONDS
-                    self._try_trigger_immediate(ctx, direct=True)
+                    self._maybe_arm_direct_countdown(ctx, new_speech=True)
                 elif ctx.trigger_evaluator.should_peek(score):
                     self._try_trigger_immediate(ctx, hard=False, soft_factors=soft_factors)
                 # 低分消息不立即触发，等静默窗口兜底
@@ -610,6 +626,7 @@ class Bot:
                 self._enqueue_chat(ctx.chat_key)
                 return False
             self._cycle_running = True
+            ctx._cycle_active = True
             return True
 
     def _enqueue_chat(self, chat_key: str):
@@ -627,9 +644,10 @@ class Bot:
             return self.private_chats.get(chat_id)
         return None
 
-    def _exit_cycle(self):
-        """退出 LLM cycle，清除运行标志。"""
+    def _exit_cycle(self, ctx: ChatContext):
+        """退出 LLM cycle，清除运行标志与 ctx 的活跃标记。"""
         with self._cycle_lock:
+            ctx._cycle_active = False
             self._cycle_running = False
 
     def _drain_cycle_queue(self):
@@ -652,12 +670,13 @@ class Bot:
                     self._cycle_queue_set.add(chat_key)
                     return
                 self._cycle_running = True
+                ctx._cycle_active = True
 
             try:
                 logger.debug(f"从队列处理 {chat_key} 的 pending cycle")
                 self._run_llm_cycle(ctx, soft_factors=None, is_active=False)
             finally:
-                self._exit_cycle()
+                self._exit_cycle(ctx)
 
     def _consume_pending_trigger(self, ctx: ChatContext) -> bool:
         """检查并消费重试标志（_run_llm_cycle while 循环末尾调用）。
@@ -673,19 +692,18 @@ class Bot:
             return False
 
     def _try_trigger_immediate(self, ctx: ChatContext, hard: bool = False, soft_factors=None,
-                               direct: bool = False, followup: bool = False):
-        """立即尝试触发 LLM（硬因子 / direct 快速 / 补触发 / 软因子路径）。
+                               direct: bool = False):
+        """立即尝试触发 LLM（硬因子 / direct 倒计时 / 软因子路径）。
 
-        冷却检查：距上次回复 < cooldown 则跳过（让静默窗口兜底）。
+        冷却检查：距上次回复 < cooldown 则跳过（改为武装回复倒计时）。
         cycle 串行检查：撞 _cycle_running 则注册重试，cycle 完成后立即重跑。
 
         Args:
             ctx: 聊天上下文（群聊/私聊）
             hard: True=硬因子触发（@/提问），False=非硬因子（群聊专用）
             soft_factors: 软因子触发时传入命中的软因子列表，供归因使用；
-                         硬因子/direct/补触发传 None，归因跳过。
-            direct: True=direct 快速触发（阶段 F，绕过 peek_threshold，归因跳过）
-            followup: True=cycle 结束后的补触发（"我说话期间别人也说了"，不看 sender）
+                         硬因子/direct 触发传 None，归因跳过。
+            direct: True=direct 倒计时到期触发（阶段 F，绕过 peek_threshold，归因跳过）
         """
         # 私聊走独立触发路径：无评分/归因/direct，只做冷却 + cycle 串行
         if ctx.chat_type == "private":
@@ -694,12 +712,9 @@ class Bot:
 
         now = time.time()
         elapsed = now - ctx.last_reply_time
-        if followup:
+        if direct:
             cooldown = SOFT_COOLDOWN_MIN
-            trigger_label = "补触发"
-        elif direct:
-            cooldown = SOFT_COOLDOWN_MIN
-            trigger_label = "direct快速"
+            trigger_label = "direct倒计时"
         elif hard:
             cooldown = HARD_COOLDOWN_SECONDS
             trigger_label = "硬因子"
@@ -708,9 +723,9 @@ class Bot:
             trigger_label = "软因子"
         if elapsed < cooldown:
             logger.debug(f"{trigger_label}触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），"
-                         f"排程到冷却结束补看")
-            # 撞冷却不丢弃：排程到冷却结束再补看（真人只是"等自己说完再听"，不是"没听到"）
-            self._maybe_schedule_buffer_followup(ctx)
+                         f"重新武装 direct 倒计时")
+            # 撞冷却不丢弃：若仍在 direct 且有未看过的消息，重新武装倒计时
+            self._maybe_arm_direct_countdown(ctx, new_speech=False)
             return
 
         if not self._try_enter_cycle(ctx):
@@ -720,7 +735,7 @@ class Bot:
         try:
             self._run_llm_cycle(ctx, soft_factors=soft_factors, is_active=False)
         finally:
-            self._exit_cycle()
+            self._exit_cycle(ctx)
             self._drain_cycle_queue()
 
     def _cooldown_seconds(self, ctx: ChatContext) -> int:
@@ -731,17 +746,17 @@ class Bot:
         return SOFT_COOLDOWN_MIN
 
     def _try_trigger_private(self, ctx: PrivateContext):
-        """私聊触发：每条消息立即尝试，回复后冷却；撞 cycle 则入队等待。
+        """私聊触发：冷却结束后进入 cycle；撞 cycle 则入队等待。
 
-        不做评分/归因/direct 判断。冷却期内到达的消息由 P003 补触发机制
-        在冷却结束时再看一眼，避免连环秒回。
+        不做评分/归因/direct 判断。正常消息由 direct 回复倒计时到期后调用；
+        撤回/戳一戳等事件走此路径立即触发。冷却期内到达的消息重新武装倒计时。
         """
         now = time.time()
         cooldown = self._cooldown_seconds(ctx)
         elapsed = now - ctx.last_reply_time
         if elapsed < cooldown:
-            logger.debug(f"私聊触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），排程到冷却结束补看")
-            self._maybe_schedule_buffer_followup(ctx)
+            logger.debug(f"私聊触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），重新武装回复倒计时")
+            self._maybe_arm_direct_countdown(ctx, new_speech=False)
             return
 
         if not self._try_enter_cycle(ctx):
@@ -751,7 +766,7 @@ class Bot:
         try:
             self._run_llm_cycle(ctx, soft_factors=None, is_active=False)
         finally:
-            self._exit_cycle()
+            self._exit_cycle(ctx)
             self._drain_cycle_queue()
 
     def _schedule_private_delayed_trigger(self, ctx: PrivateContext, minutes: int):
@@ -812,7 +827,7 @@ class Bot:
             try:
                 self._run_llm_cycle(ctx, soft_factors=None, is_active=False)
             finally:
-                self._exit_cycle()
+                self._exit_cycle(ctx)
                 self._drain_cycle_queue()
         except Exception as e:
             logger.error(f"静默窗口兜底触发异常: {e}", exc_info=True)
@@ -836,7 +851,7 @@ class Bot:
             try:
                 self._run_llm_cycle(ctx, soft_factors=None, is_active=True)
             finally:
-                self._exit_cycle()
+                self._exit_cycle(ctx)
                 self._drain_cycle_queue()
         except Exception as e:
             logger.error(f"群 {group_id} 主动触发异常: {e}", exc_info=True)
@@ -858,13 +873,13 @@ class Bot:
         pending/messages/affinity/attribution 只在本线程访问，无竞争。
         """
         while True:
-            # 记录本次 iteration 起点：用于判断"本轮是否真的发出了回复"（补触发只用回复轮）
-            turn_started_at = time.time()
-
             # 1. drain fast_buffer
             drained = ctx.history.drain_buffer_to_pending()
             if drained > 0:
                 logger.debug(f"drain {drained} 条消息到 pending")
+            # drain 之后仍留在 fast_buffer 的才是"本轮输出期间到达、LLM 没看过"的欠账；
+            # 先清掉旧标记，之后到达的消息会由接收线程重新置位
+            ctx._backlog_pending = False
 
             # 2. 延迟回复到期
             due_count = ctx.history.pop_due_delayed_into_pending()
@@ -876,6 +891,8 @@ class Bot:
                 logger.debug("pending 为空，跳过 LLM 调用")
                 if self._consume_pending_trigger(ctx):
                     continue
+                # 极小概率的竞态：drain 之后、检查之前又有新消息进来
+                self._maybe_arm_direct_countdown(ctx, new_speech=False)
                 return
 
             # 4. 构建 user_content（创建快照供 reply/react 段引用）
@@ -932,25 +949,17 @@ class Bot:
             #      （模拟真人"说完一轮先听一会"，不立即接话）
             #    - 若本轮 cycle 返回 silent（last_reply_time 较旧）：没说过话，新消息立即重跑
             #      （模拟真人"没开口时新消息值得看一眼"）
-            #    - 例外（P003 修复）：若本轮确实发了言，cycle 期间到达且未被看到的消息
-            #      会在退出前排程为补触发（等完软冷却就补看一眼，不走 150s 静默窗口）
+            #    - P003 v2.4：退出前检查"输出期间到达、LLM 没看过"的欠账。
+            #      若已进入 direct（或私聊），武装回复倒计时，等对方停口后再回一次；
+            #      未进入 direct 的群聊不武装，交给静默窗口/常规触发。
             soft_factors = None
             is_active = False
-            replied_this_turn = ctx.last_reply_time >= turn_started_at
             if not self._consume_pending_trigger(ctx):
-                # P003 修复：本轮若真的发了言，则 LLM 调用/发送期间到达的消息
-                # （drain 之后才进 fast_buffer，LLM 没看到）值得补看一眼——
-                # 不限 sender，任何人在"我说话时"插的话都算。silent 轮不补，
-                # 否则活跃群里低分消息会把 cycle 连成无限循环。
-                # 私聊例外：每条消息都是对 Bot 说的，silent 轮也要补看滞留消息
-                # （每个对象最多补到当前这批看完为止，用户停止发言后自然收敛）。
-                if replied_this_turn or ctx.chat_type == "private":
-                    self._maybe_schedule_buffer_followup(ctx)
+                self._maybe_arm_direct_countdown(ctx, new_speech=False)
                 return
             if time.time() - ctx.last_reply_time < self._cooldown_seconds(ctx):
                 logger.debug("刚回完消息，新触发等冷却结束（攒消息等下一轮）")
-                if replied_this_turn or ctx.chat_type == "private":
-                    self._maybe_schedule_buffer_followup(ctx)
+                self._maybe_arm_direct_countdown(ctx, new_speech=False)
                 return
             logger.debug("上一轮 silent，立即重跑 cycle 处理撞锁的新触发")
             # 继续循环
@@ -1049,6 +1058,7 @@ class Bot:
                 logger.info(f"LLM 输出 conversation_mode=open，清空 direct_targets（{len(ctx.direct_targets)} 个）")
                 ctx.direct_targets.clear()
             ctx.conversation_mode = "open"
+            self._cancel_direct_countdown(ctx)
             return
 
         # conversation_mode=direct，解析 targets 为 QQ 列表
@@ -1058,6 +1068,7 @@ class Bot:
             logger.info("conversation_mode=direct 但 targets 无可解析 QQ，强制 open")
             ctx.direct_targets.clear()
             ctx.conversation_mode = "open"
+            self._cancel_direct_countdown(ctx)
             return
 
         # 为每个有效 target 设置 deadline（保留字典中其他未过期 target）
@@ -1111,51 +1122,99 @@ class Bot:
         if not ctx.direct_targets and ctx.conversation_mode == "direct":
             ctx.conversation_mode = "open"
             logger.debug("direct_targets 全部过期，conversation_mode 回落 open")
+            self._cancel_direct_countdown(ctx)
 
-    def _has_unseen_buffered_messages(self, ctx: ChatContext) -> bool:
-        """fast_buffer 中是否有本轮 drain 之后到达、LLM 尚未看到的群消息（不含 bot）。"""
-        return ctx.history.has_unseen_buffered_messages()
+    def _direct_countdown_eligible(self, ctx: ChatContext) -> bool:
+        """是否具备武装 direct 回复倒计时的条件。
 
-    def _maybe_schedule_buffer_followup(self, ctx: ChatContext):
-        """为 cycle 期间到达但未被 LLM 看到的消息补一次触发。
-
-        问题背景（P003）：
-        Bot 在 LLM 调用/发送期间，别人也发了言。这些消息进了 fast_buffer，但本 cycle
-        的 drain 已经在开头执行过，LLM 看不到它们；而等本轮结束、direct 窗口之类的
-        状态建立后，又不会再有"消息到达事件"为它们触发。若无人补这一眼，只能等
-        QUIET_WINDOW_SECONDS（150s）静默兜底，很可能已错过对话节奏。
-
-        修复方式：schedule 一个一次性定时器，在软冷却结束时走补触发。
-        不限定 sender——任何人在"我说话时"插的话都算，正好模拟真人的同时发言应对。
-        是否只在回复轮调用由调用方决定（silent 轮不补，避免无限循环）。
-        已有定时器时不重复排程。
-
-        并发：定时器回调在独立线程执行，_try_trigger_immediate 内部有 cycle 串行保护。
+        - 共同前提：fast_buffer 里有本轮 drain 之后到达、LLM 尚未看到的消息
+        - 群聊：conversation_mode=direct 且至少一个 target 未过期
+        - 私聊：恒为 1v1，只要有未看到的消息即可
         """
-        if not self._has_unseen_buffered_messages(ctx):
+        if not ctx.history.has_unseen_buffered_messages():
+            return False
+        if ctx.chat_type == "private":
+            return True
+        if ctx.conversation_mode != "direct":
+            return False
+        now = time.time()
+        snapshot = dict(ctx.direct_targets)  # dict 拷贝，避免跨线程迭代异常
+        return any(deadline > now for deadline in snapshot.values())
+
+    def _maybe_arm_direct_countdown(self, ctx: ChatContext, new_speech: bool):
+        """武装/重置 direct 回复倒计时（P003 v2.4）。
+
+        设计（替代 v2.1 的固定延迟补触发）：
+        - Bot 输出期间到达的消息先打标记（_backlog_pending）；本轮结束若进入 direct
+          （或私聊），武装倒计时，而不是固定延迟后无条件再调一次 LLM。
+        - new_speech=True：direct target（私聊为对方）刚发新消息，重置倒计时；
+          最多重置 DIRECT_COUNTDOWN_MAX_RESETS 次，之后不再重置，让当前倒计时自然到期。
+        - new_speech=False：cycle 退出/撞冷却时补武装，不消耗重置次数。
+        - 倒计时到期后一次性 drain 整批欠账，LLM 一次看到用户连发的全部内容，只回一次。
+
+        并发：定时器回调在独立线程，_try_trigger_immediate 内部有 cycle 串行保护。
+        """
+        if not self._direct_countdown_eligible(ctx):
+            # 条件不满足（已离开 direct / 没有未看过的消息）：撤销旧的倒计时
+            self._cancel_direct_countdown(ctx)
             return
-        with ctx._buffer_followup_lock:
-            if ctx._buffer_followup_timer is not None:
-                return  # 已排程，避免同一批滞留消息重复触发
-            delay = max(0.05, ctx.last_reply_time + self._cooldown_seconds(ctx) - time.time()) + 0.1
-            timer = threading.Timer(delay, self._on_buffer_followup_timeout, args=(ctx,))
+
+        with ctx._countdown_lock:
+            if ctx._countdown_timer is not None:
+                if not new_speech:
+                    return  # 已武装，补检查不重复重置
+                if ctx._countdown_resets >= DIRECT_COUNTDOWN_MAX_RESETS:
+                    logger.debug(f"{ctx.chat_key} 倒计时重置已达上限 "
+                                 f"{DIRECT_COUNTDOWN_MAX_RESETS} 次，不再重置")
+                    return
+                ctx._countdown_resets += 1
+                ctx._countdown_timer.cancel()
+            # 倒计时长度：至少等 target 停口 N 秒；若刚回复过，还要覆盖冷却
+            delay = max(
+                DIRECT_REPLY_COUNTDOWN_SECONDS,
+                ctx.last_reply_time + self._cooldown_seconds(ctx) - time.time(),
+            )
+            ctx._countdown_gen += 1
+            gen = ctx._countdown_gen
+            timer = threading.Timer(delay, self._on_direct_countdown_timeout, args=(ctx, gen))
             timer.daemon = True
             timer.start()
-            ctx._buffer_followup_timer = timer
-        logger.info(f"补触发排程：buffer 中仍有未看到的消息，{delay:.1f}s 后补看一眼")
+            ctx._countdown_timer = timer
+            resets = ctx._countdown_resets
+        # 首次武装记 INFO，连发重置记 DEBUG，避免活跃对话刷日志
+        log = logger.info if resets == 0 else logger.debug
+        log(f"{ctx.chat_key} direct 回复倒计时武装：{delay:.1f}s 后触发"
+            f"（resets={resets}/{DIRECT_COUNTDOWN_MAX_RESETS}"
+            f"{'，backlog' if ctx._backlog_pending else ''}）")
 
-    def _on_buffer_followup_timeout(self, ctx: ChatContext):
-        """补触发定时器到期：确认 buffer 中仍有未看到的消息后执行触发。"""
+    def _cancel_direct_countdown(self, ctx: ChatContext):
+        """撤销 direct 回复倒计时并清理标记。"""
+        with ctx._countdown_lock:
+            if ctx._countdown_timer is not None:
+                ctx._countdown_timer.cancel()
+                ctx._countdown_timer = None
+            ctx._countdown_gen += 1  # 使已进入回调的旧 gen 失效
+            ctx._countdown_resets = 0
+            ctx._backlog_pending = False
+
+    def _on_direct_countdown_timeout(self, ctx: ChatContext, gen: int):
+        """direct 回复倒计时到期：仍有未看过的消息才触发一次。"""
         try:
-            with ctx._buffer_followup_lock:
-                ctx._buffer_followup_timer = None
-            if not self._has_unseen_buffered_messages(ctx):
-                # 期间已被新一轮 cycle drain 消费
+            with ctx._countdown_lock:
+                if gen != ctx._countdown_gen:
+                    return  # 已被重置/撤销，旧回调失效
+                ctx._countdown_timer = None
+                ctx._countdown_resets = 0
+                ctx._backlog_pending = False
+            if not self._direct_countdown_eligible(ctx):
                 return
-            logger.info("补触发到期：buffer 中仍有未看到的消息，执行触发")
-            self._try_trigger_immediate(ctx, followup=True)
+            logger.info(f"{ctx.chat_key} direct 回复倒计时到期，触发一轮")
+            if ctx.chat_type == "private":
+                self._try_trigger_private(ctx)
+            else:
+                self._try_trigger_immediate(ctx, direct=True)
         except Exception as e:
-            logger.error(f"补触发异常: {e}", exc_info=True)
+            logger.error(f"{ctx.chat_key} direct 回复倒计时异常: {e}", exc_info=True)
 
     def _send_messages(self, ctx: ChatContext, messages: list):
         """发送消息列表，带间隔。

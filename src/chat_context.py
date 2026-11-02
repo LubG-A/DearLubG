@@ -5,7 +5,7 @@
 - last_reply_time（冷却计时）
 - 触发定时器（群聊静默窗口；私聊不使用）
 - _cycle_pending（撞 cycle 重试标志）
-- 补触发定时器（P003：Bot 发言期间到达但未被 LLM 看到的消息）
+- 同时发言标记 + direct 回复倒计时（P003 v2.4）
 
 场景差异由子类补充：
 - GroupContext：评分、归因、direct 状态、主动触发调度器
@@ -41,9 +41,16 @@ class ChatContext:
         # cycle 串行重试标志（per-chat）
         self._cycle_pending: bool = False
 
-        # P003 补触发定时器（群聊与私聊共用）
-        self._buffer_followup_timer: Optional[threading.Timer] = None
-        self._buffer_followup_lock = threading.Lock()
+        # 同时发言标记 + direct 回复倒计时（P003 v2.4）
+        # _cycle_active：本 chat 的 LLM cycle 是否正在跑
+        # _backlog_pending：Bot 输出期间有新消息进入（信号量/标记）
+        # _countdown_timer/_lock/_gen/_resets：direct 回复倒计时（target 停口 N 秒后才回）
+        self._cycle_active: bool = False
+        self._backlog_pending: bool = False
+        self._countdown_timer: Optional[threading.Timer] = None
+        self._countdown_lock = threading.Lock()
+        self._countdown_resets: int = 0
+        self._countdown_gen: int = 0
 
     @property
     def chat_key(self) -> str:
