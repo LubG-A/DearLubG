@@ -70,15 +70,13 @@ class MediaLibrary:
 
         lines = [
             "\n\n# 你的素材库（可选发送的多媒体文件）",
-            "下面是你可以选择发送的多媒体文件清单，每条含路径或 URL 及内容描述。",
-            "想发送某条时，把对应路径/URL 原样复制进 messages 段：",
-            "- 语音（本地）：[{\"type\":\"voice\",\"data\":{\"channel\":\"local_file\",\"file\":\"<path>\"}}]",
-            "- 语音（网络）：[{\"type\":\"voice\",\"data\":{\"channel\":\"url\",\"url\":\"<url>\"}}]",
-            "- 图片（本地）：[{\"type\":\"image\",\"data\":{\"file\":\"<path>\"}}]",
-            "- 图片（网络）：[{\"type\":\"image\",\"data\":{\"url\":\"<url>\"}}]",
-            "- 视频（本地）：[{\"type\":\"video\",\"data\":{\"file\":\"<path>\"}}]",
-            "- 视频（网络）：[{\"type\":\"video\",\"data\":{\"url\":\"<url>\"}}]",
-            "只在语境自然合适时用，不要为用而用；与文字搭配时单独作为一条消息发送。",
+            "下面是你可以选择发送的文件清单，每条含路径/URL 及内容描述。",
+            "想发送某条时，把对应路径/URL 原样复制进 say 的段标签（不要用 JSON 段、不要用 CQ 码）：",
+            "- 音频（本地文件）：say: [voice_file:路径]",
+            "- 音频（网络地址）：say: [voice_url:URL]",
+            "- 图片：say: [img:路径或URL]",
+            "- 视频：say: [video:路径或URL]",
+            "特殊段单独占一条 say，不要和文字混在同一句。只在语境自然合适时用，不要为用而用。",
         ]
         for cat, label in (("audio", "## 音频"), ("video", "## 视频"), ("image", "## 图片")):
             items = self.entries.get(cat, [])
@@ -87,5 +85,6 @@ class MediaLibrary:
             lines.append(label)
             for e in items:
                 loc = e["path"] if e["type"] == "file" else e["url"]
-                lines.append(f"- {loc} —— {e.get('desc', '')}")
+                kind = "本地文件" if e["type"] == "file" else "网络地址"
+                lines.append(f"- （{kind}）{loc} —— {e.get('desc', '')}")
         return "\n".join(lines)

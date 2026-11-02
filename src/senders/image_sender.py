@@ -5,7 +5,10 @@
 - 网络图片（data.url 字段）：先同步下载到本地临时文件（规避 NapCat 10s 超时），再走 file 通道。
 
 配合素材库 manifest 使用：LLM 从 system prompt 的素材库描述选取路径/URL，
-原样输出到 image 段 data.file/data.url，本 sender 透传给 NapCat。
+通过行指令 `say: [img:路径或URL]` 输出，parser 转成 image 段后由本 sender 发送。
+
+格式兼容：QQ 富媒体不支持 AVIF/HEIC 等新格式（NapCat 会报 "rich media transfer failed"），
+发送前用 Pillow 检查，必要时转成 PNG。
 """
 from pathlib import Path
 
@@ -14,6 +17,39 @@ from ..media_downloader import download_to_local
 from ..utils.logger import get_logger
 
 logger = get_logger("image_sender")
+
+# QQ/NapCat 可直接发送的常见图片格式（Pillow 的 format 名称）
+SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "GIF", "WEBP", "BMP"}
+
+
+def _ensure_supported_image(file_path: str) -> str:
+    """确保图片格式可被 NapCat/QQ 发送。
+
+    AVIF/HEIC 等格式不支持时用 Pillow 转成 PNG（同目录缓存，避免重复转换）。
+    Pillow 缺失或转换失败返回空串，调用方跳过发送。
+    """
+    path = Path(file_path)
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning("Pillow 未安装，无法检查/转换非常见图片格式（建议安装 Pillow）")
+        return file_path
+
+    try:
+        with Image.open(path) as im:
+            fmt = (im.format or "").upper()
+            if fmt in SUPPORTED_IMAGE_FORMATS:
+                return file_path
+            converted = path.with_suffix(".png")
+            if not converted.exists():
+                im.convert("RGB").save(converted, "PNG")
+                logger.info(f"图片格式 {fmt} 不受 QQ 支持，已转换为 PNG: {converted.name}")
+            else:
+                logger.info(f"命中已转换的 PNG: {converted.name}")
+            return str(converted)
+    except Exception as e:
+        logger.warning(f"图片格式检查/转换失败，跳过发送: {e} (file={file_path})")
+        return ""
 
 
 class NapCatImageSender:
@@ -37,7 +73,7 @@ class NapCatImageSender:
             image_data: 含 url（网络）或 file（本地）字段
 
         Returns:
-            True=发送成功，False=失败（下载失败/发送失败）
+            True=发送成功，False=失败（下载失败/格式不支持/发送失败）
         """
         url = image_data.get("url", "")
         file_path = image_data.get("file", "")
@@ -51,6 +87,12 @@ class NapCatImageSender:
 
         if not file_path or not Path(file_path).exists():
             logger.warning(f"image 本地文件不存在且无 url: file={file_path}")
+            return False
+
+        # 格式兼容：AVIF/HEIC 等 NapCat/QQ 不支持的格式转 PNG
+        file_path = _ensure_supported_image(file_path)
+        if not file_path:
+            logger.warning(f"图片格式不受支持且转换失败，跳过发送: file={image_data.get('file', '')}")
             return False
 
         # 转成 file:// URI：NapCat 是独立进程，CWD 与本进程不同，相对路径无法解析

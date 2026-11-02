@@ -5,7 +5,7 @@
 - 网络视频（data.url 字段）：先同步下载到本地临时文件（规避 NapCat 10s 超时），再走 file 通道。
 
 配合素材库 manifest 使用：LLM 从 system prompt 的素材库描述选取路径/URL，
-原样输出到 video 段 data.file/data.url，本 sender 透传给 NapCat。
+通过行指令 `say: [video:路径或URL]` 输出，parser 转成 video 段后由本 sender 发送。
 """
 from pathlib import Path
 
