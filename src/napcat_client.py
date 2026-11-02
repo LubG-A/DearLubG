@@ -105,6 +105,19 @@ class NapCatClient:
             "message": message,
         }, timeout=timeout)
 
+    def send_private_msg(self, user_id: str, message: list, timeout: int = 30) -> dict:
+        """发送私聊消息（消息段数组形式）。"""
+        return self._call("send_private_msg", {
+            "user_id": user_id,
+            "message": message,
+        }, timeout=timeout)
+
+    def send_message(self, chat_type: str, chat_id: str, message: list, timeout: int = 30) -> dict:
+        """按聊天类型分派：group -> /send_group_msg，private -> /send_private_msg。"""
+        if chat_type == "private":
+            return self.send_private_msg(chat_id, message, timeout=timeout)
+        return self.send_group_msg(chat_id, message, timeout=timeout)
+
     def send_group_ai_record(self, group_id: str, character: str, text: str) -> dict:
         """发送 AI 语音。"""
         return self._call("send_group_ai_record", {
@@ -147,12 +160,42 @@ class NapCatClient:
         return characters
 
     def send_group_forward_msg(self, group_id: str, messages: list, title: str = "") -> dict:
-        """发送合并转发。"""
+        """发送群合并转发。"""
         return self._call("send_group_forward_msg", {
             "group_id": group_id,
             "messages": messages,
             "title": title,
         })
+
+    def send_private_forward_msg(self, user_id: str, messages: list, title: str = "") -> dict:
+        """发送私聊合并转发。"""
+        return self._call("send_private_forward_msg", {
+            "user_id": user_id,
+            "messages": messages,
+            "title": title,
+        })
+
+    def send_forward(self, chat_type: str, chat_id: str, messages: list, title: str = "") -> dict:
+        """按聊天类型分派合并转发。"""
+        if chat_type == "private":
+            return self.send_private_forward_msg(chat_id, messages, title)
+        return self.send_group_forward_msg(chat_id, messages, title)
+
+    def get_ai_record(self, character: str, group_id: str, text: str) -> str:
+        """获取 AI 语音 URL（/get_ai_record）。
+
+        私聊没有 /send_group_ai_record，需先取语音 URL，下载后以 record 段发送。
+        失败返回空串。
+        """
+        resp = self._call("get_ai_record", {
+            "character": character,
+            "group_id": group_id,
+            "text": text,
+        }, timeout=30)
+        if not resp:
+            return ""
+        data = resp.get("data")
+        return data if isinstance(data, str) else ""
 
     def fetch_ptt_text(self, message_id: str, quiet: bool = False) -> str:
         """获取语音转文字结果（/fetch_ptt_text）。
@@ -174,20 +217,27 @@ class NapCatClient:
 class NapCatWebhookServer:
     """接收 NapCat HTTP 上报的 webhook 服务。
 
-    NapCat 收到群消息后会 POST 到本服务，触发回调。
+    NapCat 收到消息后会 POST 到本服务，触发回调。
     群过滤由 Bot 的回调方法完成（ctx = self.groups.get(group_id); if ctx is None: return）。
-    群消息走 on_message 回调，撤回通知（group_recall）走 on_recall 回调，
-    戳一戳通知（notify/poke）走 on_poke 回调。
+    群消息走 on_message 回调，私聊消息走 on_private_message 回调；
+    群撤回（group_recall）/ 私聊撤回（friend_recall）分别走 on_recall / on_private_recall；
+    戳一戳（notify/poke）按是否携带 group_id 分发到 on_poke / on_private_poke。
     """
 
     def __init__(self, host: str, port: int, on_message: Callable[[dict], None],
                  on_recall: Optional[Callable[[dict], None]] = None,
-                 on_poke: Optional[Callable[[dict], None]] = None):
+                 on_poke: Optional[Callable[[dict], None]] = None,
+                 on_private_message: Optional[Callable[[dict], None]] = None,
+                 on_private_recall: Optional[Callable[[dict], None]] = None,
+                 on_private_poke: Optional[Callable[[dict], None]] = None):
         self.host = host
         self.port = port
         self.on_message = on_message
         self.on_recall = on_recall
         self.on_poke = on_poke
+        self.on_private_message = on_private_message
+        self.on_private_recall = on_private_recall
+        self.on_private_poke = on_private_poke
         self._server: Optional[HTTPServer] = None
 
     def start(self):
@@ -195,6 +245,9 @@ class NapCatWebhookServer:
         on_message = self.on_message
         on_recall = self.on_recall
         on_poke = self.on_poke
+        on_private_message = self.on_private_message
+        on_private_recall = self.on_private_recall
+        on_private_poke = self.on_private_poke
 
         class Handler(BaseHTTPRequestHandler):
             def _read_body(self):
@@ -236,16 +289,28 @@ class NapCatWebhookServer:
                     data = json.loads(body)
                     post_type = data.get("post_type", "")
                     logger.info(f"解析成功，post_type={post_type}")
-                    if post_type == "message" and data.get("message_type") == "group":
-                        # 群过滤由 Bot 回调方法完成（ctx is None 则丢弃）
-                        Thread(target=on_message, args=(data,), daemon=True).start()
-                    elif post_type == "notice" and data.get("notice_type") == "group_recall":
-                        if on_recall:
-                            Thread(target=on_recall, args=(data,), daemon=True).start()
-                    elif post_type == "notice" and data.get("notice_type") == "notify" \
-                            and data.get("sub_type") == "poke":
-                        if on_poke:
-                            Thread(target=on_poke, args=(data,), daemon=True).start()
+                    if post_type == "message":
+                        message_type = data.get("message_type", "")
+                        if message_type == "group":
+                            # 群过滤由 Bot 回调方法完成（ctx is None 则丢弃）
+                            Thread(target=on_message, args=(data,), daemon=True).start()
+                        elif message_type == "private" and on_private_message:
+                            Thread(target=on_private_message, args=(data,), daemon=True).start()
+                    elif post_type == "notice":
+                        notice_type = data.get("notice_type", "")
+                        if notice_type == "group_recall":
+                            if on_recall:
+                                Thread(target=on_recall, args=(data,), daemon=True).start()
+                        elif notice_type == "friend_recall":
+                            if on_private_recall:
+                                Thread(target=on_private_recall, args=(data,), daemon=True).start()
+                        elif notice_type == "notify" and data.get("sub_type") == "poke":
+                            # 群戳带 group_id；私聊戳没有 group_id
+                            if data.get("group_id"):
+                                if on_poke:
+                                    Thread(target=on_poke, args=(data,), daemon=True).start()
+                            elif on_private_poke:
+                                Thread(target=on_private_poke, args=(data,), daemon=True).start()
                 except Exception as e:
                     logger.error(f"处理上报失败: {e}")
                 self.send_response(200)

@@ -25,7 +25,7 @@ class LLMClient:
 
     # 历史压缩用的 system prompt（方案A分层压缩）
     _SUMMARY_SYSTEM_PROMPT = (
-        "你是对话摘要助手。把以下群聊多轮对话压缩成要点，严格保留：\n"
+        "你是对话摘要助手。把以下多轮对话压缩成要点，严格保留：\n"
         "1. 谁和 LubG 有过互动/冲突（带昵称和 QQ 号尾号）\n"
         "2. 话题脉络（聊了什么主题、有什么结论或未结的话题）\n"
         "3. LubG 表达过的立场/承诺/口头禅使用情况\n"
@@ -107,7 +107,7 @@ class LLMClient:
         # 把对话列表拼成可读文本喂给 LLM
         lines = []
         for m in messages_to_compress:
-            role = "群消息" if m["role"] == "user" else "LubG回复"
+            role = "对方消息" if m["role"] == "user" else "LubG回复"
             # user content 可能很长（含群成员列表头部），只取后 300 字（消息正文部分）
             content = m["content"][-300:] if len(m["content"]) > 300 else m["content"]
             lines.append(f"[{role}] {content}")

@@ -28,11 +28,12 @@ class NapCatVideoSender:
         self.timeout = timeout
         self.temp_dir = temp_dir
 
-    def send(self, group_id: str, video_data: dict) -> bool:
+    def send(self, chat_type: str, chat_id: str, video_data: dict) -> bool:
         """发送视频。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             video_data: 含 url（网络）或 file（本地）字段
 
         Returns:
@@ -55,5 +56,5 @@ class NapCatVideoSender:
         # 转成 file:// URI：NapCat 是独立进程，CWD 与本进程不同，相对路径无法解析
         file_uri = Path(file_path).resolve().as_uri()
         seg = [{"type": "video", "data": {"file": file_uri}}]
-        resp = self.client.send_group_msg(group_id, seg)
+        resp = self.client.send_message(chat_type, chat_id, seg)
         return bool(resp)

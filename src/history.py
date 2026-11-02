@@ -44,7 +44,7 @@ class HistoryManager:
     def __init__(self, config: TriggerConfig, state_dir: str = "state"):
         self.config = config
         self.state_dir = Path(state_dir)
-        self.state_dir.mkdir(exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
         self.file = self.state_dir / "conversation.json"
         # messages: [{"role":"user","content":"..."}, {"role":"assistant","content":"...行指令..."}, ...]
         self.messages: list[dict] = []

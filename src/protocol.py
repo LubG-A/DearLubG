@@ -3,17 +3,18 @@
 主流程只依赖以下 5 个协议接口，不依赖具体实现。
 各接口的"空实现"或"预留实现"在后续迭代中替换为真实实现时，主流程零修改。
 """
-from typing import Protocol, Any
+from typing import Protocol
 
 
 class MessageSender(Protocol):
-    """统一消息发送入口，负责把 OneBot 消息段数组发到指定群。"""
+    """统一消息发送入口，负责把 OneBot 消息段数组发到指定聊天（群聊 / 私聊）。"""
 
-    def send_group_message(self, group_id: str, segments: list[dict]) -> dict:
-        """发送消息段数组到指定群。
+    def send(self, chat_type: str, chat_id: str, segments: list[dict]) -> dict:
+        """发送消息段数组。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             segments: OneBot 消息段列表，如 [{"type":"text","data":{"text":"..."}}]
 
         Returns:
@@ -25,11 +26,12 @@ class MessageSender(Protocol):
 class VoiceSender(Protocol):
     """语音发送接口。channel 字段决定具体实现（ai_record / local_file / url）。"""
 
-    def send(self, group_id: str, voice_data: dict) -> bool:
+    def send(self, chat_type: str, chat_id: str, voice_data: dict) -> bool:
         """发送语音消息。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             voice_data: 语音数据，含 channel/text/file/url 等字段
 
         Returns:
@@ -43,11 +45,12 @@ class ImageSender(Protocol):
     网络通道先同步下载到本地（规避 NapCat 10s 超时），再走 file 通道。
     """
 
-    def send(self, group_id: str, image_data: dict) -> bool:
+    def send(self, chat_type: str, chat_id: str, image_data: dict) -> bool:
         """发送图片消息。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             image_data: 图片数据，含 url（网络）或 file（本地）字段
 
         Returns:
@@ -61,11 +64,12 @@ class VideoSender(Protocol):
     网络通道先同步下载到本地（规避 NapCat 10s 超时），再走 file 通道。
     """
 
-    def send(self, group_id: str, video_data: dict) -> bool:
+    def send(self, chat_type: str, chat_id: str, video_data: dict) -> bool:
         """发送视频消息。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             video_data: 视频数据，含 url（网络）或 file（本地）字段
 
         Returns:
@@ -75,13 +79,14 @@ class VideoSender(Protocol):
 
 
 class EmojiReactor(Protocol):
-    """emoji 反应接口。当前阶段为预留实现，等 image 系统完成后统一实现。"""
+    """emoji 反应接口。"""
 
-    def react(self, group_id: str, msg_id: str, emoji_id: str) -> dict:
+    def react(self, chat_type: str, chat_id: str, msg_id: str, emoji_id: str) -> dict:
         """对指定消息做 emoji 反应。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             msg_id: 被反应的消息 ID
             emoji_id: OneBot emoji ID
 

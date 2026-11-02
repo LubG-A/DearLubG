@@ -2,8 +2,6 @@
 
 负责 text/at/reply/face/forward 等普通段的拼装与发送。
 """
-from typing import Optional
-
 from ..napcat_client import NapCatClient
 from ..utils.logger import get_logger
 
@@ -16,9 +14,9 @@ class NapCatMessageSender:
     def __init__(self, client: NapCatClient):
         self.client = client
 
-    def send_group_message(self, group_id: str, segments: list[dict]) -> dict:
-        """发送消息段数组到指定群。"""
-        return self.client.send_group_msg(group_id, segments)
+    def send(self, chat_type: str, chat_id: str, segments: list[dict]) -> dict:
+        """发送消息段数组到指定聊天（群聊 / 私聊）。"""
+        return self.client.send_message(chat_type, chat_id, segments)
 
     def build_segments(self, messages: list, history) -> list[list[dict]]:
         """把模型输出的 messages 转换为 OneBot 消息段数组的列表。

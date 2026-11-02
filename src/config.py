@@ -67,6 +67,17 @@ class MediaDownloadConfig:
 
 
 @dataclass
+class PrivateConfig:
+    """私聊配置。
+
+    私聊是群聊的减法：只回应白名单用户的一对一消息，不做评分/归因/主动触发。
+    """
+    enabled: bool = True
+    allow_list: list = field(default_factory=list)  # 允许私聊的 QQ 白名单
+    cooldown_seconds: int = 3                        # 回复后的冷却（秒）
+
+
+@dataclass
 class Config:
     napcat: NapCatConfig
     llm: LLMConfig
@@ -77,6 +88,7 @@ class Config:
     trigger_hard_factors: dict # 硬因子 base_value（不参与归因）
     active_trigger: ActiveTriggerConfig = None  # 主动触发配置
     media_download: MediaDownloadConfig = None  # 媒体下载配置
+    private: PrivateConfig = None                # 私聊配置
 
 
 def load_config(path: str = "config.yaml") -> Config:
@@ -100,6 +112,13 @@ def load_config(path: str = "config.yaml") -> Config:
         temp_dir=md_raw.get("temp_dir", "media/downloaded"),
     )
 
+    private_raw = raw.get("private", {})
+    private = PrivateConfig(
+        enabled=private_raw.get("enabled", True),
+        allow_list=[str(q) for q in private_raw.get("allow_list", [])],
+        cooldown_seconds=private_raw.get("cooldown_seconds", 3),
+    )
+
     return Config(
         napcat=NapCatConfig(
             base_url=raw["napcat"]["base_url"],
@@ -113,4 +132,5 @@ def load_config(path: str = "config.yaml") -> Config:
         trigger_hard_factors=raw.get("trigger_hard_factors", {}),
         active_trigger=active,
         media_download=media_download,
+        private=private,
     )

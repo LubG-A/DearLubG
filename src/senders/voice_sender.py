@@ -4,7 +4,8 @@
 通过 VoiceSender 接口隔离，未来可插入新 TTS 引擎。
 
 设计说明：
-- ai_record 通道：调用 NapCat 内置 /send_group_ai_record，零依赖，character 由 config 配置。
+- ai_record 通道：群聊调用 NapCat 内置 /send_group_ai_record；私聊没有对应 API，
+  改用 /get_ai_record 获取语音 URL，下载后以 record 段通过 /send_private_msg 发送。
 - local_file 通道：发送本地音频文件（OB11 record 段，data.file 字段）。作为"可复用原语"保留——
   未来接入 TTS 引擎时，TTS 输出重定向到文件后即可复用此 sender 发送 record 段，无需改动主流程。
 - url 通道：网络音频先同步下载到本地临时文件（规避 NapCat 10s 超时），再走 local_file 路径发送 record 段。
@@ -19,21 +20,29 @@ logger = get_logger("voice_sender")
 
 
 class AIRecordVoiceSender:
-    """AI 语音发送器，调用 /send_group_ai_record。
+    """AI 语音发送器。
 
-    调用失败时（character 无效、网络错误等）按 fallback_to_text 决定是否降级为文字。
+    群聊调用 /send_group_ai_record；私聊调用 /get_ai_record 拿 URL 后下载发送 record 段。
+    调用失败时按 fallback_to_text 决定是否降级为文字。
     """
 
-    def __init__(self, client: NapCatClient, character: str, fallback_to_text: bool = True):
+    def __init__(self, client: NapCatClient, character: str, fallback_to_text: bool = True,
+                 anchor_group_id: str = "", timeout: int = 30,
+                 temp_dir: str = "media/downloaded"):
         self.client = client
         self.character = character
         self.fallback_to_text = fallback_to_text
+        # /get_ai_record 需要 group_id 作为角色上下文；私聊复用配置中的第一个群
+        self.anchor_group_id = anchor_group_id
+        self.timeout = timeout
+        self.temp_dir = temp_dir
 
-    def send(self, group_id: str, voice_data: dict) -> bool:
+    def send(self, chat_type: str, chat_id: str, voice_data: dict) -> bool:
         """发送 AI 语音。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             voice_data: 含 text 字段
 
         Returns:
@@ -44,20 +53,51 @@ class AIRecordVoiceSender:
             logger.warning("voice 段缺少 text，跳过")
             return False
 
-        # send_group_ai_record 内部已通过 _call 检查业务 status，失败返回 {}
-        result = self.client.send_group_ai_record(group_id, self.character, text)
-        if result:
-            logger.info(f"AI 语音发送成功: {text[:30]}...")
-            return True
+        if chat_type == "group":
+            # send_group_ai_record 内部已通过 _call 检查业务 status，失败返回 {}
+            result = self.client.send_group_ai_record(chat_id, self.character, text)
+            if result:
+                logger.info(f"AI 语音发送成功（群 {chat_id}）: {text[:30]}...")
+                return True
+        else:
+            if self._send_private_ai_record(chat_id, text):
+                return True
 
-        # 发送失败
-        logger.error(f"AI 语音发送失败: character={self.character} text={text[:30]}...")
+        logger.error(f"AI 语音发送失败: chat={chat_type}:{chat_id} character={self.character} text={text[:30]}...")
         if self.fallback_to_text:
             logger.info("降级为 text 段发送（fallback_to_text=true）")
-            resp = self.client.send_group_msg(group_id, [
+            resp = self.client.send_message(chat_type, chat_id, [
                 {"type": "text", "data": {"text": text}},
             ])
             return bool(resp)
+        return False
+
+    def _send_private_ai_record(self, user_id: str, text: str) -> bool:
+        """/get_ai_record → 下载 → record 段发送（私聊通道）。"""
+        if not self.anchor_group_id:
+            logger.warning("私聊 AI 语音缺少锚点群号（group_ids 为空），无法调用 /get_ai_record")
+            return False
+        url = self.client.get_ai_record(self.character, self.anchor_group_id, text)
+        if not url:
+            logger.warning(f"私聊 AI 语音获取 URL 失败: text={text[:30]}...")
+            return False
+        if url.startswith(("http://", "https://")):
+            file_path = download_to_local(url, timeout=self.timeout, temp_dir=self.temp_dir)
+        else:
+            # 兼容 NapCat 直接返回本地路径/file:// URI 的情况
+            file_path = url[7:] if url.startswith("file://") else url
+            if not Path(file_path).exists():
+                file_path = ""
+        if not file_path:
+            logger.warning(f"私聊 AI 语音下载失败: url={url[:80]}")
+            return False
+        file_uri = Path(file_path).resolve().as_uri()
+        resp = self.client.send_message("private", user_id, [
+            {"type": "record", "data": {"file": file_uri}},
+        ])
+        if resp:
+            logger.info(f"私聊 AI 语音发送成功（{user_id}）: {text[:30]}...")
+            return True
         return False
 
 
@@ -71,11 +111,12 @@ class LocalFileVoiceSender:
     def __init__(self, client: NapCatClient):
         self.client = client
 
-    def send(self, group_id: str, voice_data: dict) -> bool:
+    def send(self, chat_type: str, chat_id: str, voice_data: dict) -> bool:
         """发送本地音频文件。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             voice_data: 含 file 字段（本地音频路径）
 
         Returns:
@@ -89,7 +130,7 @@ class LocalFileVoiceSender:
         # 转成 file:// URI：NapCat 是独立进程，CWD 与本进程不同，相对路径无法解析
         file_uri = Path(file_path).resolve().as_uri()
         record_seg = [{"type": "record", "data": {"file": file_uri}}]
-        resp = self.client.send_group_msg(group_id, record_seg)
+        resp = self.client.send_message(chat_type, chat_id, record_seg)
         return bool(resp)
 
 
@@ -106,11 +147,12 @@ class UrlVoiceSender:
         self.temp_dir = temp_dir
         self.local_sender = LocalFileVoiceSender(client)
 
-    def send(self, group_id: str, voice_data: dict) -> bool:
+    def send(self, chat_type: str, chat_id: str, voice_data: dict) -> bool:
         """发送网络音频。
 
         Args:
-            group_id: 目标群号
+            chat_type: "group" 或 "private"
+            chat_id: 群号或私聊对方 QQ
             voice_data: 含 url 字段（网络音频地址）
 
         Returns:
@@ -129,4 +171,4 @@ class UrlVoiceSender:
 
         # 复用 local_file 通道发送
         local_data = {"file": file_path}
-        return self.local_sender.send(group_id, local_data)
+        return self.local_sender.send(chat_type, chat_id, local_data)

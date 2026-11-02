@@ -1,8 +1,8 @@
-"""QQ 群聊机器人主入口。
+"""QQ 群聊/私聊机器人主入口。
 
 流程：
-- 被动触发：群聊消息 -> 入 fast_buffer -> 评分 -> 触发决策（硬因子短冷却立即 / 软因子静默窗口兜底）
-              -> LLM 调用（_cycle_running 串行）-> drain buffer 到 pending -> 结果处理
+- 群聊被动触发：群消息 -> 入 fast_buffer -> 评分 -> 触发决策（硬因子短冷却立即 / direct 快速 / 软因子 / 静默窗口兜底）
+- 私聊触发：白名单私聊消息 -> 入 fast_buffer -> 立即触发（仅冷却 + P003 补触发，无评分/归因）
 - 主动触发：定时器唤醒 -> LLM 调用（无新消息，让 LLM 自主决定要不要主动开口）
 - 延迟回复：LLM 输出 reply_delay_minutes -> 消息暂存 -> 下次触发时重新加入 pending
 
@@ -10,19 +10,15 @@
 - 接收线程（webhook）只写 fast_buffer（HistoryManager 内 _buffer_lock 保护，持锁极短）
 - LLM 工作线程用 _cycle_running 标志保证串行，LLM 调用和发送不持锁
 - _cycle_lock 只保护"检查+设置 _cycle_running"（持锁极短），不覆盖 LLM 调用
-- 撞 cycle 时注册 ctx._cycle_pending（per-group），cycle 完成后立即重跑（不等静默窗口 20 秒）
-- 静默窗口定时器：每条新消息重置，150s 无新消息则触发兜底 LLM 调用
+- 撞 cycle 时注册 ctx._cycle_pending（per-chat），cycle 完成后立即重跑（不等静默窗口）
+- 群聊静默窗口：每条新消息重置，150s 无新消息则触发兜底 LLM 调用；私聊无静默窗口
 
 阶段 A 重构：per-group 状态移入 GroupContext（src/group_context.py），
 Bot 持有 self.groups: dict[str, GroupContext]，方法通过 ctx 参数访问 per-group 状态。
 全局共享单例（napcat/llm/affinity/persona/senders）仍留在 Bot。
 
 阶段 B：多群配置（config.group_ids）+ 全局 cycle 队列。
-- NapCatClient 方法接受 group_id 参数，member_cache 嵌套化 {group_id: {qq: info}}
-- webhook 去掉单群过滤，按 group_id 路由到对应 ctx
-- per-group 文件存储：state/{group_id}/ 子目录
-- _cycle_queue + _cycle_queue_set：cycle 结束后处理其他撞 cycle 的群
-- 主动触发关闭（阶段 D 每群独立倒计时后开启）
+阶段 I：私聊支持——ChatContext 基类 + PrivateContext，群聊/私聊共用 cycle 与发送链。
 """
 import time
 import random
@@ -42,6 +38,8 @@ from src.senders.image_sender import NapCatImageSender
 from src.senders.video_sender import NapCatVideoSender
 from src.senders.emoji_reactor import EmojiReactor
 from src.group_context import GroupContext
+from src.private_context import PrivateContext
+from src.chat_context import ChatContext
 from src.utils.logger import get_logger
 
 logger = get_logger("main")
@@ -68,16 +66,20 @@ class Bot:
         self.persona_renderer = PersonaRenderer(self.config)
 
         # Sender 实现（全局共享）
-        self.message_sender = NapCatMessageSender(self.napcat)
-        self.ai_voice_sender = AIRecordVoiceSender(
-            self.napcat, self.config.voice.ai_record_character, self.config.voice.fallback_to_text
-        )
-        self.local_voice_sender = LocalFileVoiceSender(self.napcat)
         # 网络资源 sender 注入下载超时与临时目录（从 config.media_download 读取，缺失用默认值）
         md = getattr(self.config, "media_download", None)
         md_timeout = md.timeout if md else 30
         md_video_timeout = md.video_timeout if md else 60
         md_temp_dir = md.temp_dir if md else "media/downloaded"
+        # 私聊 AI 语音通过 /get_ai_record 生成，需要一个锚点群号作为角色上下文
+        anchor_group_id = self.config.napcat.group_ids[0] if self.config.napcat.group_ids else ""
+
+        self.message_sender = NapCatMessageSender(self.napcat)
+        self.ai_voice_sender = AIRecordVoiceSender(
+            self.napcat, self.config.voice.ai_record_character, self.config.voice.fallback_to_text,
+            anchor_group_id=anchor_group_id, timeout=md_timeout, temp_dir=md_temp_dir,
+        )
+        self.local_voice_sender = LocalFileVoiceSender(self.napcat)
         self.url_voice_sender = UrlVoiceSender(self.napcat, timeout=md_timeout, temp_dir=md_temp_dir)
         self.image_sender = NapCatImageSender(self.napcat, timeout=md_timeout, temp_dir=md_temp_dir)
         self.video_sender = NapCatVideoSender(self.napcat, timeout=md_video_timeout, temp_dir=md_temp_dir)
@@ -93,14 +95,17 @@ class Bot:
         # _cycle_pending 已移入 GroupContext（per-group，多群下各群独立重试标志）
         self._cycle_lock = threading.Lock()
         self._cycle_running: bool = False
-        # 全局 cycle 队列：cycle 结束后处理其他撞 cycle 的群（阶段 B）
+        # 全局 cycle 队列：cycle 结束后处理其他撞 cycle 的聊天（阶段 B，chat_key 泛化）
         self._cycle_queue: deque[str] = deque()
         self._cycle_queue_set: set[str] = set()
 
         # per-group 上下文表：{group_id -> GroupContext}
-        # 阶段 A 单群，warmup 时填充一个 GroupContext
         # 阶段 B 起支持多群，启动时为每个配置的 group_id 构造一个
         self.groups: dict[str, GroupContext] = {}
+        # per-user 私聊上下文表：{qq -> PrivateContext}，首次收到白名单私聊时懒创建
+        self.private_chats: dict[str, PrivateContext] = {}
+        # 私聊上下文懒创建锁：接收线程并发到达时避免同一 QQ 创建两个上下文
+        self._private_ctx_lock = threading.Lock()
 
     def warmup(self):
         """启动预热。"""
@@ -125,6 +130,14 @@ class Bot:
         self._probe_ai_voice_character()
         logger.info(f"预热完成，机器人 {self.self_nickname}({self.self_qq})，"
                     f"群 {list(self.groups.keys())}")
+        if self.config.private and self.config.private.enabled:
+            allow = self.config.private.allow_list
+            if allow:
+                logger.info(f"私聊已启用，白名单 {len(allow)} 人：{allow}")
+            else:
+                logger.warning("私聊已启用但 allow_list 为空，所有私聊消息都会被忽略")
+        else:
+            logger.info("私聊已禁用")
 
         # 阶段 D：为每群启动主动触发调度器（per-group 独立倒计时）
         if self.config.active_trigger and self.config.active_trigger.enabled:
@@ -144,6 +157,9 @@ class Bot:
         失败不阻塞启动，仅记 WARNING（语音调用时会触发 fallback_to_text）。
         """
         character = self.config.voice.ai_record_character
+        if not self.config.napcat.group_ids:
+            logger.warning("未配置群号，跳过 AI 语音 character 探测")
+            return
         group_id = self.config.napcat.group_ids[0]  # 用第一个群探测
         try:
             characters = self.napcat.get_ai_characters(group_id)
@@ -217,6 +233,106 @@ class Bot:
         except Exception as e:
             logger.error(f"处理戳一戳失败: {e}", exc_info=True)
 
+    # ---------- 私聊 ----------
+    def _is_private_allowed(self, user_qq: str) -> bool:
+        """私聊准入：启用 + 非自己 + 白名单。"""
+        if not self.config.private or not self.config.private.enabled:
+            return False
+        if not user_qq or user_qq == self.self_qq:
+            return False
+        if user_qq not in set(self.config.private.allow_list):
+            logger.debug(f"私聊 {user_qq} 不在白名单，忽略")
+            return False
+        return True
+
+    def _get_or_create_private_ctx(self, user_qq: str, nickname: str = "") -> PrivateContext:
+        """获取或懒创建私聊上下文（加锁避免并发创建重复上下文）。"""
+        with self._private_ctx_lock:
+            ctx = self.private_chats.get(user_qq)
+            if ctx is None:
+                ctx = PrivateContext(user_qq, nickname or user_qq, self.config, self.llm)
+                self.private_chats[user_qq] = ctx
+                logger.info(f"创建私聊上下文：{ctx.peer_nickname}({user_qq})，状态目录 state/private/{user_qq}/")
+            elif nickname and nickname != user_qq and nickname != ctx.peer_nickname:
+                ctx.peer_nickname = nickname
+            return ctx
+
+    def on_private_message(self, msg: dict):
+        """处理收到的私聊消息（接收线程）。
+
+        私聊是群聊的减法：不评分、不归因、不设静默窗口。
+        每条消息立即尝试触发；若 Bot 正在 LLM 调用/发送，新消息进 fast_buffer，
+        本轮结束后由 P003 补触发机制在冷却结束时再看一眼。
+        """
+        try:
+            user_qq = str(msg.get("user_id", ""))
+            if not self._is_private_allowed(user_qq):
+                return
+
+            sender = msg.get("sender") or {}
+            sender_nick = sender.get("nickname") or msg.get("nickname") or user_qq
+            content = msg.get("raw_message", "") or _extract_text_from_msg(msg)
+            msg_id = str(msg.get("message_id", ""))
+
+            has_voice = self._has_voice_segment(msg)
+            if has_voice:
+                content = (content + (" " if content else "") + "[语音消息]").strip()
+
+            ctx = self._get_or_create_private_ctx(user_qq, sender_nick)
+
+            # 入 fast_buffer（与 bot 回复共用入口，保持真实发言顺序）
+            ctx.history.append_group_message(user_qq, sender_nick, content, msg_id)
+
+            # 语音转写：异步延迟重试，成功后回填历史 content
+            if has_voice and msg_id:
+                threading.Thread(target=self._transcribe_voice_async, args=(ctx, msg_id), daemon=True).start()
+
+            self._try_trigger_private(ctx)
+        except Exception as e:
+            logger.error(f"处理私聊消息异常: {e}", exc_info=True)
+
+    def on_private_recall(self, data: dict):
+        """处理私聊撤回通知（friend_recall）。
+
+        user_id 为撤回者（私聊对象）。追加撤回通知伪消息后触发一次 LLM 看一眼。
+        """
+        try:
+            user_qq = str(data.get("user_id", "") or data.get("operator_id", ""))
+            if not self._is_private_allowed(user_qq):
+                return
+            recalled_msg_id = str(data.get("message_id", ""))
+            if not recalled_msg_id:
+                logger.warning(f"私聊撤回通知缺少 message_id: {data}")
+                return
+            ctx = self.private_chats.get(user_qq)
+            if ctx is None:
+                return
+            logger.info(f"收到私聊撤回通知: recalled_msg_id={recalled_msg_id} user={user_qq}")
+            ctx.history.append_recall_notice(recalled_msg_id, user_qq)
+            self._try_trigger_private(ctx)
+        except Exception as e:
+            logger.error(f"处理私聊撤回通知失败: {e}", exc_info=True)
+
+    def on_private_poke(self, data: dict):
+        """处理私聊戳一戳通知。
+
+        只处理 target_id == 自己 QQ 的戳一戳。追加伪消息后立即尝试触发。
+        """
+        try:
+            target_id = str(data.get("target_id", ""))
+            poker_id = str(data.get("user_id", ""))
+            if target_id != self.self_qq:
+                logger.debug(f"忽略非戳自己的私聊 poke: target={target_id} poker={poker_id}")
+                return
+            if not self._is_private_allowed(poker_id):
+                return
+            ctx = self.private_chats.get(poker_id) or self._get_or_create_private_ctx(poker_id)
+            logger.info(f"收到私聊戳一戳: poker={ctx.peer_nickname}({poker_id})")
+            ctx.history.append_poke_notice(poker_id, ctx.peer_nickname)
+            self._try_trigger_private(ctx)
+        except Exception as e:
+            logger.error(f"处理私聊戳一戳失败: {e}", exc_info=True)
+
     def on_group_message(self, msg: dict):
         """处理收到的群消息（接收线程，无 _cycle_lock）。
 
@@ -286,7 +402,7 @@ class Bot:
         """消息是否含语音段（record）。"""
         return any(seg.get("type") == "record" for seg in msg.get("message", []))
 
-    def _transcribe_voice_async(self, ctx: GroupContext, msg_id: str):
+    def _transcribe_voice_async(self, ctx: ChatContext, msg_id: str):
         """异步转写语音：分级延迟重试，成功后回填历史 content。
 
         NapCat 收到语音消息后需先从腾讯下载 amr 文件到本地，立即调用 fetch_ptt_text
@@ -322,7 +438,7 @@ class Bot:
             return True
         return False
 
-    def _try_enter_cycle(self, ctx: GroupContext) -> bool:
+    def _try_enter_cycle(self, ctx: ChatContext) -> bool:
         """尝试进入 LLM cycle（B2 方案）。
 
         用 _cycle_running 标志保证 cycle 串行，代替 _llm_lock 覆盖全流程。
@@ -338,16 +454,25 @@ class Bot:
         with self._cycle_lock:
             if self._cycle_running:
                 ctx._cycle_pending = True
-                self._enqueue_group(ctx.group_id)
+                self._enqueue_chat(ctx.chat_key)
                 return False
             self._cycle_running = True
             return True
 
-    def _enqueue_group(self, group_id: str):
-        """群入队 cycle 队列（去重）。在 _cycle_lock 保护下调用。"""
-        if group_id not in self._cycle_queue_set:
-            self._cycle_queue.append(group_id)
-            self._cycle_queue_set.add(group_id)
+    def _enqueue_chat(self, chat_key: str):
+        """聊天入队 cycle 队列（去重）。在 _cycle_lock 保护下调用。"""
+        if chat_key not in self._cycle_queue_set:
+            self._cycle_queue.append(chat_key)
+            self._cycle_queue_set.add(chat_key)
+
+    def _get_context(self, chat_key: str) -> Optional[ChatContext]:
+        """按 chat_key 解析上下文：group:{gid} / private:{qq}。"""
+        kind, _, chat_id = chat_key.partition(":")
+        if kind == "group":
+            return self.groups.get(chat_id)
+        if kind == "private":
+            return self.private_chats.get(chat_id)
+        return None
 
     def _exit_cycle(self):
         """退出 LLM cycle，清除运行标志。"""
@@ -361,27 +486,27 @@ class Bot:
         每次从队首取一个群，执行 _run_llm_cycle，结束后继续取下一个。
         """
         while self._cycle_queue:
-            group_id = self._cycle_queue.popleft()
-            self._cycle_queue_set.discard(group_id)
-            ctx = self.groups.get(group_id)
+            chat_key = self._cycle_queue.popleft()
+            self._cycle_queue_set.discard(chat_key)
+            ctx = self._get_context(chat_key)
             if ctx is None or not ctx._cycle_pending:
                 continue  # 已被消费或不存在
 
             with self._cycle_lock:
                 if self._cycle_running:
                     # 不应该发生（_cycle_running 刚清），防御性重新入队
-                    self._cycle_queue.appendleft(group_id)
-                    self._cycle_queue_set.add(group_id)
+                    self._cycle_queue.appendleft(chat_key)
+                    self._cycle_queue_set.add(chat_key)
                     return
                 self._cycle_running = True
 
             try:
-                logger.debug(f"从队列处理群 {group_id} 的 pending cycle")
+                logger.debug(f"从队列处理 {chat_key} 的 pending cycle")
                 self._run_llm_cycle(ctx, soft_factors=None, is_active=False)
             finally:
                 self._exit_cycle()
 
-    def _consume_pending_trigger(self, ctx: GroupContext) -> bool:
+    def _consume_pending_trigger(self, ctx: ChatContext) -> bool:
         """检查并消费重试标志（_run_llm_cycle while 循环末尾调用）。
 
         Returns:
@@ -394,7 +519,7 @@ class Bot:
                 return True
             return False
 
-    def _try_trigger_immediate(self, ctx: GroupContext, hard: bool = False, soft_factors=None,
+    def _try_trigger_immediate(self, ctx: ChatContext, hard: bool = False, soft_factors=None,
                                direct: bool = False, followup: bool = False):
         """立即尝试触发 LLM（硬因子 / direct 快速 / 补触发 / 软因子路径）。
 
@@ -402,13 +527,18 @@ class Bot:
         cycle 串行检查：撞 _cycle_running 则注册重试，cycle 完成后立即重跑。
 
         Args:
-            ctx: 群上下文（per-group 冷却时间和 _cycle_pending）
-            hard: True=硬因子触发（@/提问），False=非硬因子
+            ctx: 聊天上下文（群聊/私聊）
+            hard: True=硬因子触发（@/提问），False=非硬因子（群聊专用）
             soft_factors: 软因子触发时传入命中的软因子列表，供归因使用；
                          硬因子/direct/补触发传 None，归因跳过。
             direct: True=direct 快速触发（阶段 F，绕过 peek_threshold，归因跳过）
             followup: True=cycle 结束后的补触发（"我说话期间别人也说了"，不看 sender）
         """
+        # 私聊走独立触发路径：无评分/归因/direct，只做冷却 + cycle 串行
+        if ctx.chat_type == "private":
+            self._try_trigger_private(ctx)
+            return
+
         now = time.time()
         elapsed = now - ctx.last_reply_time
         if followup:
@@ -439,6 +569,59 @@ class Bot:
         finally:
             self._exit_cycle()
             self._drain_cycle_queue()
+
+    def _cooldown_seconds(self, ctx: ChatContext) -> int:
+        """当前聊天的冷却秒数：群聊用 SOFT_COOLDOWN_MIN，私聊用配置值。"""
+        if ctx.chat_type == "private":
+            cfg = self.config.private
+            return cfg.cooldown_seconds if cfg else 3
+        return SOFT_COOLDOWN_MIN
+
+    def _try_trigger_private(self, ctx: PrivateContext):
+        """私聊触发：每条消息立即尝试，回复后冷却；撞 cycle 则入队等待。
+
+        不做评分/归因/direct 判断。冷却期内到达的消息由 P003 补触发机制
+        在冷却结束时再看一眼，避免连环秒回。
+        """
+        now = time.time()
+        cooldown = self._cooldown_seconds(ctx)
+        elapsed = now - ctx.last_reply_time
+        if elapsed < cooldown:
+            logger.debug(f"私聊触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），排程到冷却结束补看")
+            self._maybe_schedule_buffer_followup(ctx)
+            return
+
+        if not self._try_enter_cycle(ctx):
+            logger.debug("私聊触发但 cycle 在跑，已入队等待")
+            return
+
+        try:
+            self._run_llm_cycle(ctx, soft_factors=None, is_active=False)
+        finally:
+            self._exit_cycle()
+            self._drain_cycle_queue()
+
+    def _schedule_private_delayed_trigger(self, ctx: PrivateContext, minutes: int):
+        """私聊延迟回复到期唤醒：N 分钟后重新触发一次 LLM。"""
+        delay = max(1.0, minutes * 60) + 1.0  # 多等 1s，确保 due_time 已过
+        with ctx._delayed_timer_lock:
+            if ctx._delayed_timer is not None:
+                ctx._delayed_timer.cancel()
+            timer = threading.Timer(delay, self._on_private_delayed_timeout, args=(ctx,))
+            timer.daemon = True
+            timer.start()
+            ctx._delayed_timer = timer
+        logger.info(f"私聊延迟回复排程：{minutes} 分钟后唤醒（{ctx.chat_id}）")
+
+    def _on_private_delayed_timeout(self, ctx: PrivateContext):
+        """私聊延迟回复定时器到期：重新触发 LLM。"""
+        try:
+            with ctx._delayed_timer_lock:
+                ctx._delayed_timer = None
+            logger.info(f"私聊延迟回复到期，重新触发（{ctx.chat_id}）")
+            self._try_trigger_private(ctx)
+        except Exception as e:
+            logger.error(f"私聊延迟回复唤醒异常: {e}", exc_info=True)
 
     def _reschedule_quiet_trigger(self, ctx: GroupContext, delay: float = QUIET_WINDOW_SECONDS):
         """重置静默窗口定时器：N 秒后若仍无新消息则兜底触发。
@@ -505,7 +688,7 @@ class Bot:
         except Exception as e:
             logger.error(f"群 {group_id} 主动触发异常: {e}", exc_info=True)
 
-    def _run_llm_cycle(self, ctx: GroupContext, soft_factors, is_active: bool):
+    def _run_llm_cycle(self, ctx: ChatContext, soft_factors, is_active: bool):
         """LLM 工作循环（B2 方案：调用方已通过 _try_enter_cycle 获取运行权）。
 
         流程（while 循环，处理撞 cycle 重试）：
@@ -544,13 +727,13 @@ class Bot:
 
             # 4. 构建 user_content（创建快照供 reply/react 段引用）
             summary = ctx.history.get_summary()
-            system_prompt = self.persona_renderer.render_system_prompt(summary)
+            system_prompt = self.persona_renderer.render_system_prompt(summary, chat_type=ctx.chat_type)
             history_messages = ctx.history.get_messages_for_llm()
             member_list = self._build_member_list(ctx)
             pending_text = ctx.history.build_user_content()
             new_user_content = self.persona_renderer.render_user_content(
                 pending_text, member_list, self.self_nickname, self.self_qq,
-                is_active=is_active,
+                is_active=is_active, chat_type=ctx.chat_type, peer=self._private_peer(ctx),
             )
 
             # 5. 调用 LLM（不持锁，_cycle_running 标志保证串行）
@@ -571,6 +754,9 @@ class Bot:
             # 延迟回复处理：LLM 觉得"等会再回"，把这批消息存到 delayed_replies
             if parsed.reply_delay_minutes > 0 and parsed.action == "silent":
                 ctx.history.stash_pending_as_delayed(parsed.reply_delay_minutes)
+                # 私聊没有主动触发兜底，需要自己排程到期唤醒
+                if ctx.chat_type == "private":
+                    self._schedule_private_delayed_trigger(ctx, parsed.reply_delay_minutes)
                 if self._consume_pending_trigger(ctx):
                     continue
                 return
@@ -597,24 +783,36 @@ class Bot:
                 # （drain 之后才进 fast_buffer，LLM 没看到）值得补看一眼——
                 # 不限 sender，任何人在"我说话时"插的话都算。silent 轮不补，
                 # 否则活跃群里低分消息会把 cycle 连成无限循环。
-                if replied_this_turn:
+                # 私聊例外：每条消息都是对 Bot 说的，silent 轮也要补看滞留消息
+                # （每个对象最多补到当前这批看完为止，用户停止发言后自然收敛）。
+                if replied_this_turn or ctx.chat_type == "private":
                     self._maybe_schedule_buffer_followup(ctx)
                 return
-            if time.time() - ctx.last_reply_time < SOFT_COOLDOWN_MIN:
-                logger.debug("刚回完消息，新触发等静默窗口兜底（攒消息等下一轮）")
-                if replied_this_turn:
+            if time.time() - ctx.last_reply_time < self._cooldown_seconds(ctx):
+                logger.debug("刚回完消息，新触发等冷却结束（攒消息等下一轮）")
+                if replied_this_turn or ctx.chat_type == "private":
                     self._maybe_schedule_buffer_followup(ctx)
                 return
             logger.debug("上一轮 silent，立即重跑 cycle 处理撞锁的新触发")
             # 继续循环
 
-    def _handle_result(self, ctx: GroupContext, parsed, soft_factors):
+    def _private_peer(self, ctx: ChatContext) -> dict:
+        """私聊对方信息（供 persona 渲染 user content）。"""
+        if ctx.chat_type != "private":
+            return {}
+        return {
+            "qq": ctx.chat_id,
+            "nickname": getattr(ctx, "peer_nickname", ctx.chat_id),
+            "affinity": self.affinity.get(ctx.chat_id),
+        }
+
+    def _handle_result(self, ctx: ChatContext, parsed, soft_factors):
         """处理 LLM 结果：执行动作 -> 写回历史 -> 亲密度 -> 归因。
 
         Args:
-            ctx: 群上下文（per-group history/attribution/last_reply_time/group_id）
+            ctx: 聊天上下文（群聊/私聊）
             parsed: 解析后的 LLM 输出
-            soft_factors: 触发评分软因子（主动触发时为 None，归因跳过）
+            soft_factors: 触发评分软因子（主动触发/私聊时为 None，归因跳过）
         """
         # 延迟：delay_seconds 叠加 0.3-1.2 秒/字的随机抖动（模拟"打字中"）
         if parsed.delay_seconds > 0 or parsed.messages:
@@ -626,13 +824,13 @@ class Bot:
                 time.sleep(total_delay)
 
         if parsed.action == "silent":
-            # 不发送，但仍更新归因（主动触发时 soft_factors=None，跳过）
+            # 不发送，但仍更新归因（主动触发/私聊时 soft_factors=None，跳过）
             if soft_factors is not None:
                 ctx.attribution.update(soft_factors, "silent")
             self.affinity.apply_delta(parsed.affinity_delta)
-            # 阶段 F：silent 保留 direct 状态（不清空 direct_targets）
-            # 只顺手清理过期 target
-            self._cleanup_expired_direct_targets(ctx)
+            # 阶段 F：silent 保留 direct 状态（仅群聊）
+            if ctx.chat_type == "group":
+                self._cleanup_expired_direct_targets(ctx)
             return
 
         if parsed.action == "react":
@@ -643,12 +841,13 @@ class Bot:
                     f"react 段 react_target_msg_id={parsed.react_target_msg_id} 无效，跳过 emoji 反应"
                 )
             else:
-                self.emoji_reactor.react(ctx.group_id, msg_id, parsed.react_emoji_id)
+                self.emoji_reactor.react(ctx.chat_type, ctx.chat_id, msg_id, parsed.react_emoji_id)
             if soft_factors is not None:
                 ctx.attribution.update(soft_factors, "react")
             self.affinity.apply_delta(parsed.affinity_delta)
-            # 阶段 F：react 保留 direct 状态（同 silent），清理过期 target
-            self._cleanup_expired_direct_targets(ctx)
+            # 阶段 F：react 保留 direct 状态（仅群聊）
+            if ctx.chat_type == "group":
+                self._cleanup_expired_direct_targets(ctx)
             return
 
         # reply / multi_reply
@@ -664,11 +863,12 @@ class Bot:
         if soft_factors is not None:
             ctx.attribution.update(soft_factors, parsed.action)
 
-        # 阶段 F：根据 LLM 输出更新 direct 状态
+        # 阶段 F：根据 LLM 输出更新 direct 状态（仅群聊）
         # - conversation_mode=direct + targets 至少一个可解析 → 为每个 target 设置 deadline
         # - conversation_mode=open 或 targets 全部不可解析 → 清空 direct_targets
         # - silent/react 已在上面处理（保留 direct 状态）
-        self._update_direct_state(ctx, parsed)
+        if ctx.chat_type == "group":
+            self._update_direct_state(ctx, parsed)
 
     def _update_direct_state(self, ctx: GroupContext, parsed):
         """阶段 F：根据 LLM 输出更新 direct 状态。
@@ -753,11 +953,11 @@ class Bot:
             ctx.conversation_mode = "open"
             logger.debug("direct_targets 全部过期，conversation_mode 回落 open")
 
-    def _has_unseen_buffered_messages(self, ctx: GroupContext) -> bool:
+    def _has_unseen_buffered_messages(self, ctx: ChatContext) -> bool:
         """fast_buffer 中是否有本轮 drain 之后到达、LLM 尚未看到的群消息（不含 bot）。"""
         return ctx.history.has_unseen_buffered_messages()
 
-    def _maybe_schedule_buffer_followup(self, ctx: GroupContext):
+    def _maybe_schedule_buffer_followup(self, ctx: ChatContext):
         """为 cycle 期间到达但未被 LLM 看到的消息补一次触发。
 
         问题背景（P003）：
@@ -778,14 +978,14 @@ class Bot:
         with ctx._buffer_followup_lock:
             if ctx._buffer_followup_timer is not None:
                 return  # 已排程，避免同一批滞留消息重复触发
-            delay = max(0.05, ctx.last_reply_time + SOFT_COOLDOWN_MIN - time.time()) + 0.1
+            delay = max(0.05, ctx.last_reply_time + self._cooldown_seconds(ctx) - time.time()) + 0.1
             timer = threading.Timer(delay, self._on_buffer_followup_timeout, args=(ctx,))
             timer.daemon = True
             timer.start()
             ctx._buffer_followup_timer = timer
         logger.info(f"补触发排程：buffer 中仍有未看到的消息，{delay:.1f}s 后补看一眼")
 
-    def _on_buffer_followup_timeout(self, ctx: GroupContext):
+    def _on_buffer_followup_timeout(self, ctx: ChatContext):
         """补触发定时器到期：确认 buffer 中仍有未看到的消息后执行触发。"""
         try:
             with ctx._buffer_followup_lock:
@@ -798,7 +998,7 @@ class Bot:
         except Exception as e:
             logger.error(f"补触发异常: {e}", exc_info=True)
 
-    def _send_messages(self, ctx: GroupContext, messages: list):
+    def _send_messages(self, ctx: ChatContext, messages: list):
         """发送消息列表，带间隔。
 
         每条消息发送完成后立即 append 到 fast_buffer（is_bot=True），
@@ -814,27 +1014,30 @@ class Bot:
             for seg in segs:
                 if seg.get("type") == "forward":
                     data = seg.get("data", {})
-                    resp = self.napcat.send_group_forward_msg(ctx.group_id, data.get("messages", []), data.get("title", ""))
+                    resp = self.napcat.send_forward(
+                        ctx.chat_type, ctx.chat_id,
+                        data.get("messages", []), data.get("title", ""),
+                    )
                     handled = True
                     sent_ok = bool(resp)
                     break
                 if seg.get("type") == "image":
-                    sent_ok = self.image_sender.send(ctx.group_id, seg.get("data", {}))
+                    sent_ok = self.image_sender.send(ctx.chat_type, ctx.chat_id, seg.get("data", {}))
                     handled = True
                     break
                 if seg.get("type") == "video":
-                    sent_ok = self.video_sender.send(ctx.group_id, seg.get("data", {}))
+                    sent_ok = self.video_sender.send(ctx.chat_type, ctx.chat_id, seg.get("data", {}))
                     handled = True
                     break
                 if seg.get("type") == "voice":
                     data = seg.get("data", {})
                     channel = data.get("channel", "ai_record")
                     if channel == "ai_record":
-                        sent_ok = self.ai_voice_sender.send(ctx.group_id, data)
+                        sent_ok = self.ai_voice_sender.send(ctx.chat_type, ctx.chat_id, data)
                     elif channel == "local_file":
-                        sent_ok = self.local_voice_sender.send(ctx.group_id, data)
+                        sent_ok = self.local_voice_sender.send(ctx.chat_type, ctx.chat_id, data)
                     elif channel == "url":
-                        sent_ok = self.url_voice_sender.send(ctx.group_id, data)
+                        sent_ok = self.url_voice_sender.send(ctx.chat_type, ctx.chat_id, data)
                     handled = True
                     break
             if handled:
@@ -845,10 +1048,12 @@ class Bot:
                     logger.warning("特殊段发送失败，不记录到历史（保持历史事实性）")
                 continue
 
-            # 普通消息段
+            # 普通消息段（私聊不需要 @，过滤 at 段避免意外 @ 对方）
             normal_segs = [s for s in segs if s.get("type") not in ("forward", "image", "video", "voice")]
+            if ctx.chat_type == "private":
+                normal_segs = [s for s in normal_segs if s.get("type") != "at"]
             if normal_segs:
-                self.message_sender.send_group_message(ctx.group_id, normal_segs)
+                self.message_sender.send(ctx.chat_type, ctx.chat_id, normal_segs)
 
             # 逐条 append 到 fast_buffer（与群消息按真实时间顺序混合）
             self._append_bot_reply_to_buffer(ctx, messages[i])
@@ -857,7 +1062,7 @@ class Bot:
             if i < len(segments_list) - 1:
                 time.sleep(random.uniform(0.8, 2.5))
 
-    def _append_bot_reply_to_buffer(self, ctx: GroupContext, msg):
+    def _append_bot_reply_to_buffer(self, ctx: ChatContext, msg):
         """把单条 bot 发言追加到 fast_buffer（is_bot=True）。
 
         在 _send_messages 每条发送完成后调用，确保发言顺序与真实群聊一致。
@@ -868,14 +1073,13 @@ class Bot:
             self.self_qq, self.self_nickname, msg_text, "", is_bot=True
         )
 
-    def _build_member_list(self, ctx: GroupContext) -> list:
+    def _build_member_list(self, ctx: ChatContext) -> list:
         """构建传给 LLM 的群成员列表（含亲密度）。
 
-        过滤规则：只展示以下成员（避免 user content 顶部塞入全群名单）：
-        - 最近 N 轮发言过的成员（recent_speakers，从 ctx.history 派生）
-        - 有亲密度记录的成员（affinity > 0，全局共享）
-        - 自己（self）
+        私聊没有群成员概念，返回空列表；user content 由 persona 渲染对方信息。
         """
+        if ctx.chat_type == "private":
+            return []
         recent_speakers = ctx.history.get_recent_speakers()
         group_members = self.napcat.member_cache.get(ctx.group_id, {})
         result = []
@@ -899,8 +1103,14 @@ class Bot:
             webhook_host, webhook_port, self.on_group_message,
             on_recall=self.on_group_recall,
             on_poke=self.on_group_poke,
+            on_private_message=self.on_private_message,
+            on_private_recall=self.on_private_recall,
+            on_private_poke=self.on_private_poke,
         )
-        logger.info(f"机器人启动，监听群 {list(self.groups.keys())}")
+        private_info = ""
+        if self.config.private and self.config.private.enabled:
+            private_info = f"，私聊白名单 {self.config.private.allow_list}"
+        logger.info(f"机器人启动，监听群 {list(self.groups.keys())}{private_info}")
         server.start()
 
 
