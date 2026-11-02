@@ -67,7 +67,11 @@ def resolve_image_path(source: dict, temp_dir: str) -> Optional[str]:
         if isinstance(f, str) and f.startswith(("http://", "https://")):
             url = f
     if url:
-        return download_to_local(url, temp_dir=temp_dir)
+        try:
+            expected_size = int(source.get("file_size") or 0) or None
+        except (TypeError, ValueError):
+            expected_size = None
+        return download_to_local(url, temp_dir=temp_dir, expected_size=expected_size)
     return None
 
 
