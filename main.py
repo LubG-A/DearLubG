@@ -394,8 +394,9 @@ class Bot:
                 return True
             return False
 
-    def _try_trigger_immediate(self, ctx: GroupContext, hard: bool = False, soft_factors=None, direct: bool = False):
-        """立即尝试触发 LLM（硬因子 / direct 快速 / 软因子路径）。
+    def _try_trigger_immediate(self, ctx: GroupContext, hard: bool = False, soft_factors=None,
+                               direct: bool = False, followup: bool = False):
+        """立即尝试触发 LLM（硬因子 / direct 快速 / 补触发 / 软因子路径）。
 
         冷却检查：距上次回复 < cooldown 则跳过（让静默窗口兜底）。
         cycle 串行检查：撞 _cycle_running 则注册重试，cycle 完成后立即重跑。
@@ -404,12 +405,16 @@ class Bot:
             ctx: 群上下文（per-group 冷却时间和 _cycle_pending）
             hard: True=硬因子触发（@/提问），False=非硬因子
             soft_factors: 软因子触发时传入命中的软因子列表，供归因使用；
-                         硬因子/direct 触发传 None，归因跳过。
+                         硬因子/direct/补触发传 None，归因跳过。
             direct: True=direct 快速触发（阶段 F，绕过 peek_threshold，归因跳过）
+            followup: True=cycle 结束后的补触发（"我说话期间别人也说了"，不看 sender）
         """
         now = time.time()
         elapsed = now - ctx.last_reply_time
-        if direct:
+        if followup:
+            cooldown = SOFT_COOLDOWN_MIN
+            trigger_label = "补触发"
+        elif direct:
             cooldown = SOFT_COOLDOWN_MIN
             trigger_label = "direct快速"
         elif hard:
@@ -419,7 +424,10 @@ class Bot:
             cooldown = SOFT_COOLDOWN_MIN
             trigger_label = "软因子"
         if elapsed < cooldown:
-            logger.debug(f"{trigger_label}触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），等静默窗口兜底")
+            logger.debug(f"{trigger_label}触发但冷却中（elapsed={elapsed:.1f}s < {cooldown}s），"
+                         f"排程到冷却结束补看")
+            # 撞冷却不丢弃：排程到冷却结束再补看（真人只是"等自己说完再听"，不是"没听到"）
+            self._maybe_schedule_buffer_followup(ctx)
             return
 
         if not self._try_enter_cycle(ctx):
@@ -514,6 +522,9 @@ class Bot:
         pending/messages/affinity/attribution 只在本线程访问，无竞争。
         """
         while True:
+            # 记录本次 iteration 起点：用于判断"本轮是否真的发出了回复"（补触发只用回复轮）
+            turn_started_at = time.time()
+
             # 1. drain fast_buffer
             drained = ctx.history.drain_buffer_to_pending()
             if drained > 0:
@@ -576,12 +587,23 @@ class Bot:
             #      （模拟真人"说完一轮先听一会"，不立即接话）
             #    - 若本轮 cycle 返回 silent（last_reply_time 较旧）：没说过话，新消息立即重跑
             #      （模拟真人"没开口时新消息值得看一眼"）
+            #    - 例外（P003 修复）：若本轮确实发了言，cycle 期间到达且未被看到的消息
+            #      会在退出前排程为补触发（等完软冷却就补看一眼，不走 150s 静默窗口）
             soft_factors = None
             is_active = False
+            replied_this_turn = ctx.last_reply_time >= turn_started_at
             if not self._consume_pending_trigger(ctx):
+                # P003 修复：本轮若真的发了言，则 LLM 调用/发送期间到达的消息
+                # （drain 之后才进 fast_buffer，LLM 没看到）值得补看一眼——
+                # 不限 sender，任何人在"我说话时"插的话都算。silent 轮不补，
+                # 否则活跃群里低分消息会把 cycle 连成无限循环。
+                if replied_this_turn:
+                    self._maybe_schedule_buffer_followup(ctx)
                 return
             if time.time() - ctx.last_reply_time < SOFT_COOLDOWN_MIN:
                 logger.debug("刚回完消息，新触发等静默窗口兜底（攒消息等下一轮）")
+                if replied_this_turn:
+                    self._maybe_schedule_buffer_followup(ctx)
                 return
             logger.debug("上一轮 silent，立即重跑 cycle 处理撞锁的新触发")
             # 继续循环
@@ -730,6 +752,51 @@ class Bot:
         if not ctx.direct_targets and ctx.conversation_mode == "direct":
             ctx.conversation_mode = "open"
             logger.debug("direct_targets 全部过期，conversation_mode 回落 open")
+
+    def _has_unseen_buffered_messages(self, ctx: GroupContext) -> bool:
+        """fast_buffer 中是否有本轮 drain 之后到达、LLM 尚未看到的群消息（不含 bot）。"""
+        return ctx.history.has_unseen_buffered_messages()
+
+    def _maybe_schedule_buffer_followup(self, ctx: GroupContext):
+        """为 cycle 期间到达但未被 LLM 看到的消息补一次触发。
+
+        问题背景（P003）：
+        Bot 在 LLM 调用/发送期间，别人也发了言。这些消息进了 fast_buffer，但本 cycle
+        的 drain 已经在开头执行过，LLM 看不到它们；而等本轮结束、direct 窗口之类的
+        状态建立后，又不会再有"消息到达事件"为它们触发。若无人补这一眼，只能等
+        QUIET_WINDOW_SECONDS（150s）静默兜底，很可能已错过对话节奏。
+
+        修复方式：schedule 一个一次性定时器，在软冷却结束时走补触发。
+        不限定 sender——任何人在"我说话时"插的话都算，正好模拟真人的同时发言应对。
+        是否只在回复轮调用由调用方决定（silent 轮不补，避免无限循环）。
+        已有定时器时不重复排程。
+
+        并发：定时器回调在独立线程执行，_try_trigger_immediate 内部有 cycle 串行保护。
+        """
+        if not self._has_unseen_buffered_messages(ctx):
+            return
+        with ctx._buffer_followup_lock:
+            if ctx._buffer_followup_timer is not None:
+                return  # 已排程，避免同一批滞留消息重复触发
+            delay = max(0.05, ctx.last_reply_time + SOFT_COOLDOWN_MIN - time.time()) + 0.1
+            timer = threading.Timer(delay, self._on_buffer_followup_timeout, args=(ctx,))
+            timer.daemon = True
+            timer.start()
+            ctx._buffer_followup_timer = timer
+        logger.info(f"补触发排程：buffer 中仍有未看到的消息，{delay:.1f}s 后补看一眼")
+
+    def _on_buffer_followup_timeout(self, ctx: GroupContext):
+        """补触发定时器到期：确认 buffer 中仍有未看到的消息后执行触发。"""
+        try:
+            with ctx._buffer_followup_lock:
+                ctx._buffer_followup_timer = None
+            if not self._has_unseen_buffered_messages(ctx):
+                # 期间已被新一轮 cycle drain 消费
+                return
+            logger.info("补触发到期：buffer 中仍有未看到的消息，执行触发")
+            self._try_trigger_immediate(ctx, followup=True)
+        except Exception as e:
+            logger.error(f"补触发异常: {e}", exc_info=True)
 
     def _send_messages(self, ctx: GroupContext, messages: list):
         """发送消息列表，带间隔。

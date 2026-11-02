@@ -76,9 +76,16 @@ class GroupContext:
 
         # 阶段 F：对话活跃度感知（direct 模式快速触发）
         # conversation_mode: "direct"=Bot 正在与某人往返对话 / "open"=开放插话
-        # direct_targets: {qq: deadline_timestamp}，每个 target 各自独立 30s 窗口
+        # direct_targets: {qq: deadline_timestamp}，每个 target 各自独立窗口（DIRECT_WINDOW_SECONDS，默认 90s）
         #   - Bot 回复且 conversation_mode=direct + targets 非空时设置
         #   - target 在窗口内发言触发快速触发（绕过 peek_threshold）
         #   - silent 保留状态，自然衰减/LLM 主动 open 时清空
         self.conversation_mode: str = "open"
         self.direct_targets: dict[str, float] = {}
+        # 阶段 F 修复：cycle 结束时的补触发定时器（P003，不限 direct target）
+        # 场景：Bot 在 LLM 调用/发送期间，别人也发了言。这些消息在本轮 cycle 的 drain
+        # 之后到达，LLM 没看到过；若没人再为它们触发，只能等 150s 静默兜底。
+        # 修复：本轮确实发出了回复时，为这些"未被看到"的消息排程一次补触发。
+        # 仅回复轮补触发（silent 轮不补），避免活跃群里低分消息把 cycle 连成无限循环。
+        self._buffer_followup_timer: Optional[threading.Timer] = None
+        self._buffer_followup_lock = threading.Lock()

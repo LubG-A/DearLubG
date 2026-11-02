@@ -147,6 +147,15 @@ class HistoryManager:
         with self._buffer_lock:
             self.fast_buffer.append(entry)
 
+    def has_unseen_buffered_messages(self) -> bool:
+        """fast_buffer 中是否有尚未被 drain 的非 bot 消息。
+
+        用于 cycle 结束时的补触发判定：drain 在 cycle 开头执行，所以此时仍留在
+        fast_buffer 的群消息必然是 LLM 调用/发送期间到达、LLM 没看到过的。
+        """
+        with self._buffer_lock:
+            return any(not m.get("is_bot") for m in self.fast_buffer)
+
     def drain_buffer_to_pending(self) -> int:
         """把 fast_buffer 原子地移到 pending（LLM 工作线程调用）。
 
