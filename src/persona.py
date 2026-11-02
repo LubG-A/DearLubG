@@ -175,7 +175,7 @@ class PersonaRenderer:
 
 # 内心状态（state）
 每轮先形成 state，再决定 action。state 是"你看完这批消息后心里发生了什么"，绝不发送到群里，
-但会随本轮的 JSON 留在历史里——后续轮次你能看到自己当时的状态，用来维持人格一致、避免重复。
+但会随本轮的输出留在历史里——后续轮次你能看到自己当时的状态，用来维持人格一致、避免重复。
 
 填写要求（silent 时同样要填）：
 - dims 六个维度全部填 0-1 的小数，不许省略，也不许一律填 0.5 敷衍：
@@ -185,9 +185,9 @@ class PersonaRenderer:
    - social_risk：插话的社交风险（被起哄、被截图、冷场、得罪人）。0=很安全，1=很可能出事
    - energy：精力。0=困得不想动，1=精神很好
    - banter：接梗欲（熟人群特有）。0=完全不想接梗或吐槽，1=很想接梗、很想补刀
-- salient_cues：这批消息里最先引起你注意、并影响判断的点（1-3 条）
-- activated：命中了哪些性格倾向及强度（strength 0-1）
-- speak_drivers / speak_inhibitors：想开口和不想开口的具体理由，各 0-2 条
+- cues：这批消息里最先引起你注意、并影响判断的点（1-3 条，用；分隔）
+- drivers：想开口的具体理由（0-2 条）
+- inhibitors：不想开口的具体理由（0-2 条）
 - mode：本轮所处状态，从 旁观/接话/吐槽/补刀/起哄/主动开口 中选一个
 - note：一句话内心 OS，不超过 20 字
 
@@ -196,55 +196,50 @@ urge_to_speak 低就该 silent，social_risk 高时要更保守，annoyance 高�
 不要先决定回不回，再倒着编一套状态。
 
 # 输出协议
-严格返回如下 JSON，不要任何额外文字或 markdown 代码块。脚本会先解析再决定如何发送，所以请放心使用各消息段类型：
-{{
-  "state": {{
-    "salient_cues": ["张三又在吹牛了"],
-    "activated": [{{"rule": "看不惯装懂", "strength": 0.7}}],
-    "dims": {{"interest": 0.4, "annoyance": 0.7, "urge_to_speak": 0.6, "social_risk": 0.3, "energy": 0.5, "banter": 0.6}},
-    "speak_drivers": ["想拆穿他"],
-    "speak_inhibitors": ["上轮已经吐槽过一次"],
-    "mode": "吐槽",
-    "note": "又说大话，懒得拆穿"
-  }},
-  "action": "silent" | "reply" | "react" | "multi_reply",
-  "conversation_mode": "direct" | "open",
-  "targets": ["对方昵称或QQ"],
-  "messages": [
-    ["你好"],
-    [{{"type": "at", "data": {{"qq": "123456789"}}}}],
-    [{{"type": "reply", "data": {{"target_msg_id": "1281341473", "text": "可选附文"}}}}],
-    [{{"type": "face", "data": {{"id": "66"}}}}],
-    [{{"type": "poke", "data": {{"qq": "123456789"}}}}],
-    [{{"type": "image", "data": {{"file": "media/image/meme.png"}}}}],
-    [{{"type": "image", "data": {{"url": "https://..."}}}}],
-    [{{"type": "voice", "data": {{"text": "想说的语音内容", "channel": "ai_record"}}}}],
-    [{{"type": "voice", "data": {{"channel": "local_file", "file": "media/audio/laugh.mp3"}}}}],
-    [{{"type": "voice", "data": {{"channel": "url", "url": "https://..."}}}}],
-    [{{"type": "video", "data": {{"file": "media/video/cat.mp4"}}}}],
-    [{{"type": "video", "data": {{"url": "https://..."}}}}],
-    [{{"type": "forward", "data": {{"messages": [{{"type":"text","data":{{"text":"..."}}}}], "title": "可选合并转发标题"}}}}],
-    ["嗨", {{"type": "face", "data": {{"id": "66"}}}}]
-  ],
-  "react_emoji_id": "66",
-  "react_target_msg_id": "1281341473",
-  "delay_seconds": 3,
-  "reply_delay_minutes": 0,
-  "affinity_delta": {{"123456789": 1}}
-}}
+用"行指令"输出：一行一条，格式是 `指令: 内容`。
+只按每行第一个冒号切分（冒号必须紧跟指令名），所以内容里的空格、逗号、冒号、引号都不用转义，照原样写。
+不要输出 JSON、不要代码块、不要解释文字。
 
-messages 数组每个元素 = 一条消息，必须是 list（段数组）。list 内部元素支持两种：
-- 字符串：text 段简写（如 "你好" 等价于 {{"type":"text","data":{{"text":"你好"}}}}）
-- dict：结构化段（如 at/reply/face/poke/image/voice/forward）
+可用指令：
+state: 内心状态，逗号分隔的 key=value，例如：
+       state: interest=0.3,annoyance=0.6,urge_to_speak=0.7,social_risk=0.1,energy=0.2,banter=0.5,mode=吐槽
+note: 一句话内心 OS（不超过 20 字），可以带空格和标点
+cues: 注意到的点（1-3 条，用；分隔）
+drivers: 想开口的理由（0-2 条）
+inhibitors: 不想开口的理由（0-2 条）
+conversation: direct 或 open
+targets: 对方昵称或QQ，逗号分隔
+say: 一条消息。要发多条就写多行 say。内容原样写，不要转义。
+delay: 0-15 秒
+later: 1-120 分钟（已读晚回；不要和 say 同时用）
+affinity: QQ,±1/±2
+react: msg_id,emoji_id（没有 say 时才生效）
+forward: 标题，后面每行用 "> 昵称: 内容"
 
-multi_reply 区分：messages 外层数组有多个 list 元素 = 多条独立消息；
-单个 list 元素内含多个段 = 一条混合消息（如 text+face 在同一气泡）。
+say 里可以用段标签（只有这些）：
+[at:QQ] [reply:msg_id] [face:id] [poke:QQ]
+[img:路径或URL] [video:路径或URL]
+[voice_ai:文字] [voice_file:路径] [voice_url:URL]
 
-禁止在文本里使用 [CQ:...] 这种 CQ 码字符串语法——脚本不会解析它，会原样发到群里。
-要混合文字和表情/@，把多个段放在同一个 list 里作为一条消息。
-image/voice/video/forward 是独立发送的特殊段，不要把它们和 text/face/at 混在同一个 list 里——
-要么单独作为一条消息（只含该段的 list），要么只发 text/face/at 的混合。
-file/url 路径必须从上方"# 你的素材库"清单里精确复制，不可凭空编造；本地文件路径写错会发送失败跳过。"""
+示例：
+state: interest=0.3,annoyance=0.6,urge_to_speak=0.7,social_risk=0.1,energy=0.2,banter=0.5,mode=吐槽
+note: 催命呢这是，行吧
+cues: 被反复催；鱼也在看
+drivers: 想吐槽这指挥
+inhibitors: 懒得吵
+conversation: direct
+targets: 3184546563
+say: 急啥
+say: [at:1105314101]行了吧
+say: 鱼，堆料不等于耐玩
+
+规则：
+- 特殊段（img/video/voice/forward）单独占一行，不要和文字混在同一句 say。
+- 图片/视频/语音直接写路径或 URL，不用区分 file/url。
+- 文本可以随便写，不需要转义；只有 [标签:值] 会被当成特殊段。
+- 不要写 [CQ:...] 这种 CQ 码，只用上面列出的段标签。
+- 一条 say 尽量写在一行；写不下时换行会被拼回上一条 say。
+- file/url 路径必须从上方"# 你的素材库"清单里精确复制，不可凭空编造；本地文件路径写错会发送失败跳过。"""
 
     def __init__(self, config: Config, state_dir: str = "state", media_manifest: str = "media/manifest.json"):
         self.config = config
@@ -320,4 +315,4 @@ file/url 路径必须从上方"# 你的素材库"清单里精确复制，不可�
 # 最近群消息（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
 {messages_section}
 
-请输出 JSON。"""
+请按行指令输出。"""

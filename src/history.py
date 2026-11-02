@@ -2,7 +2,7 @@
 
 存储结构：messages 列表，严格 user/assistant 交替。
 - user：每轮"看一眼"触发时的群消息批次
-- assistant：LLM 返回的完整 JSON（含 state 内心状态，无论 action 是什么）
+- assistant：LLM 返回的完整行指令输出（含 state 内心状态，无论 action 是什么）
 
 每轮 LLM 调用必有 assistant 落地，silent 也是真实回复。
 超过阈值时对早期 user/assistant 对做分层压缩（方案A）：
@@ -46,7 +46,7 @@ class HistoryManager:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(exist_ok=True)
         self.file = self.state_dir / "conversation.json"
-        # messages: [{"role":"user","content":"..."}, {"role":"assistant","content":"...JSON..."}, ...]
+        # messages: [{"role":"user","content":"..."}, {"role":"assistant","content":"...行指令..."}, ...]
         self.messages: list[dict] = []
         # 早期对话摘要（压缩后塞进 system 末尾）
         # 包含中期 LLM 摘要 + 远期朴素摘要，按时间倒序拼接（最近摘要在前）
@@ -85,6 +85,31 @@ class HistoryManager:
                 self.delayed_replies = data.get("delayed_replies", [])
             except Exception as e:
                 logger.warning(f"加载历史失败: {e}")
+        self._migrate_legacy_messages()
+
+    def _migrate_legacy_messages(self):
+        """P005 迁移：旧 assistant 是 JSON，会教模型继续输出 JSON。
+
+        检测到旧格式时归档原文件并清空 messages（summary/pending/delayed 保留），
+        避免新协议上线后模型整段模仿旧 JSON、被 parser 全部丢弃。
+        """
+        legacy = any(
+            m.get("role") == "assistant" and str(m.get("content", "")).lstrip().startswith("{")
+            for m in self.messages
+        )
+        if not legacy:
+            return
+        backup = self.file.with_name("conversation.legacy.json")
+        try:
+            backup.write_text(self.file.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"旧历史归档失败（继续清空内存）: {e}")
+        self.messages = []
+        try:
+            self._save()
+        except OSError as e:
+            logger.warning(f"旧历史清理落盘失败（下次 append_turn 会覆盖）: {e}")
+        logger.warning(f"检测到旧 JSON 历史，已归档到 {backup} 并清空 messages（P005 迁移）")
 
     def _save(self):
         """原子写入：临时文件 + rename，避免压缩中途崩溃导致文件损坏。"""
@@ -245,7 +270,7 @@ class HistoryManager:
 
         Args:
             user_content: 本轮群消息批次
-            assistant_content: LLM 返回的完整 JSON 字符串
+            assistant_content: LLM 返回的完整行指令文本
         """
         self.messages.append({"role": "user", "content": user_content})
         self.messages.append({"role": "assistant", "content": assistant_content})
@@ -333,7 +358,7 @@ class HistoryManager:
 
         P003 方案 A：对历史 user message 做标记转换，消除"回复触发点"：
         - 除最后一条 user 外，user content 开头的 "# 当前上下文" → "# 历史上下文"
-        - 除最后一条 user 外，删除末尾的 "请输出 JSON。"
+        - 除最后一条 user 外，删除末尾的 "请按行指令输出。"（兼容旧历史的 "请输出 JSON。"）
         目的：让 LLM 明确区分历史参考材料与当前请求，避免注意力漂移到历史旧话题。
 
         转换在返回时做，不持久化到 conversation.json，不影响其他功能。
@@ -357,8 +382,9 @@ class HistoryManager:
                 # 替换开头标记
                 if content.startswith("# 当前上下文"):
                     content = "# 历史上下文" + content[len("# 当前上下文"):]
-                # 删除末尾的"请输出 JSON。"（兼容不同换行情况）
-                for suffix in ("\n\n请输出 JSON。", "\n请输出 JSON。", "请输出 JSON。"):
+                # 删除末尾的输出指令（兼容新协议与旧 JSON 历史）
+                for suffix in ("\n\n请按行指令输出。", "\n请按行指令输出。", "请按行指令输出。",
+                               "\n\n请输出 JSON。", "\n请输出 JSON。", "请输出 JSON。"):
                     if content.endswith(suffix):
                         content = content[:-len(suffix)]
                         break
@@ -374,7 +400,7 @@ class HistoryManager:
         - user content：只扫描 "# 最近群消息" 标记之后的消息行，
           用正则提取 nickname(qq) 模式中的 qq。跳过顶部群成员列表，
           否则 member_list 里的人会被误捕为"近期发言者"导致只增不减。
-        - assistant content：JSON 解析 targets 字段
+        - assistant content：扫描 `targets:` 行
 
         以及当前 pending_group_msgs 中的 qq。
 
@@ -412,13 +438,15 @@ class HistoryManager:
                 for match in re.finditer(r'\((\d{5,})\)', content):
                     qqs.add(match.group(1))
             elif msg["role"] == "assistant":
-                # assistant content 是 JSON，里面有 targets
-                try:
-                    data = json.loads(msg["content"])
-                    for qq in data.get("targets", []):
-                        qqs.add(str(qq))
-                except (ValueError, TypeError):
-                    pass
+                # assistant content 是行指令输出，targets 在 `targets:` 行
+                for line in msg["content"].splitlines():
+                    line = line.strip()
+                    if line.startswith("targets:") or line.startswith("targets："):
+                        payload = line[len("targets") + 1:]
+                        for t in payload.split(","):
+                            if t.strip():
+                                qqs.add(t.strip())
+                        break
 
         return qqs
 

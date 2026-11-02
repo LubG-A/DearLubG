@@ -1,5 +1,4 @@
 """大模型 API 调用客户端。"""
-import json
 import time
 import requests
 from typing import Optional
@@ -17,7 +16,7 @@ class LLMClient:
     messages = [
         {"role": "system", "content": "人格+协议+早期摘要"},
         {"role": "user", "content": "群消息批次1"},
-        {"role": "assistant", "content": "LLM 返回的完整 JSON（含 state，无论 silent 还是 reply）"},
+        {"role": "assistant", "content": "LLM 返回的完整行指令输出（含 state，无论 silent 还是 reply）"},
         {"role": "user", "content": "群消息批次2"},
         {"role": "assistant", "content": "..."},
         ...
@@ -52,7 +51,7 @@ class LLMClient:
             new_user_content: 本轮新增的 user 内容（群消息批次）
 
         Returns:
-            LLM 返回的原始字符串内容（通常为 JSON 字符串），失败返回 None
+            LLM 返回的原始字符串内容（行指令文本），失败返回 None
         """
         headers = {
             "Content-Type": "application/json",
@@ -67,7 +66,6 @@ class LLMClient:
         payload = {
             "model": self.model,
             "messages": messages,
-            "response_format": {"type": "json_object"},
         }
 
         # 最多重试 2 次（共 2 次请求）

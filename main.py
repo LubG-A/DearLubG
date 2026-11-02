@@ -51,7 +51,7 @@ HARD_COOLDOWN_SECONDS = 3       # 硬因子（@/提问）触发冷却，距上�
 SOFT_COOLDOWN_MIN = 5         # 软因子触发冷却下限
 SOFT_COOLDOWN_MAX = 60         # 软因子触发冷却上限
 QUIET_WINDOW_SECONDS = 150       # 静默窗口：N 秒无新消息后兜底触发
-DIRECT_WINDOW_SECONDS = 45      # 阶段 F：direct 模式活跃窗口，target 在此窗口内发言触发快速触发
+DIRECT_WINDOW_SECONDS = 90      # 阶段 F：direct 模式活跃窗口，target 在此窗口内发言触发快速触发
 
 
 class Bot:

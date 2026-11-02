@@ -1,22 +1,25 @@
-"""LLM 输出 JSON 解析与校验模块。
+"""LLM 输出解析与校验模块（P005 行指令协议）。
 
-严格校验，解析失败 fallback silent，绝不把脏数据发到群里。
+协议见 P005_返回结构行指令协议方案.md：
+- 一行一条指令，格式 `指令: 载荷`；
+- 指令词固定白名单，前缀匹配，不用通用正则；
+- 一行坏只丢一行，绝不把脏数据发到群里。
 """
-import json
-from typing import Optional
+import re
 from dataclasses import dataclass, field
 
 from .utils.logger import get_logger
 
 logger = get_logger("parser")
 
-VALID_ACTIONS = {"silent", "reply", "react", "multi_reply"}
-VALID_MSG_TYPES = {"text", "at", "reply", "face", "image", "voice", "video", "forward"}
-VALID_CONVERSATION_MODES = {"direct", "open"}
+COMMANDS = ("state", "note", "cues", "drivers", "inhibitors",
+            "conversation", "targets", "delay", "later", "affinity", "react", "say", "forward")
+# 可续行的自由文本指令
+FREE_TEXT_CMDS = ("note", "cues", "drivers", "inhibitors")
 # 阶段 G：结构化内心状态的固定维度（全部 clip 到 [0,1]）
-# banter（接梗欲）替换 empathy（共情），更贴合熟人群语境
 STATE_DIMS = ("interest", "annoyance", "urge_to_speak", "social_risk", "energy", "banter")
 VALID_STATE_MODES = {"旁观", "接话", "吐槽", "补刀", "起哄", "主动开口"}
+SEG_TAGS = {"at", "reply", "face", "poke", "img", "video", "voice_ai", "voice_file", "voice_url"}
 
 
 @dataclass
@@ -35,241 +38,244 @@ class ParsedResult:
 
 
 def parse_and_validate(raw_content: str) -> ParsedResult:
-    """解析并校验 LLM 输出。
+    """解析行指令输出。
 
-    Args:
-        raw_content: LLM 返回的原始字符串
-
-    Returns:
-        ParsedResult，解析失败返回 action=silent 的默认结果
+    逐行解析，未知/非法行只丢该行；解析不出任何有效内容时返回 silent。
     """
+    result = ParsedResult()
     if not isinstance(raw_content, str):
         logger.error(f"raw_content 非 str 类型: {type(raw_content)}，fallback silent")
-        return ParsedResult(action="silent")
+        return result
 
-    # LLM 返回可能有前缀空白字符或 markdown 代码块包裹，先清理
-    stripped = raw_content.strip()
-    if stripped.startswith("```"):
-        # 去除 markdown 代码块
-        lines = stripped.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
+    messages = []
+    forward_idx = None
+    last_free = None  # 上一条可续行的指令：say / note / cues / drivers / inhibitors
 
-    try:
-        data = json.loads(stripped)
-    except (json.JSONDecodeError, TypeError) as e:
-        logger.error(f"JSON 解析失败: {e}，raw={stripped[:200]}，fallback silent")
-        return ParsedResult(action="silent")
+    def close_forward():
+        nonlocal forward_idx
+        if forward_idx is not None:
+            # 没有 > 子行的 forward 整条丢弃
+            if not messages[forward_idx][0]["data"]["messages"]:
+                messages.pop(forward_idx)
+            forward_idx = None
 
-    # action 校验
-    action = data.get("action", "silent")
-    if action not in VALID_ACTIONS:
-        logger.error(f"非法 action={action}，fallback silent")
-        return ParsedResult(action="silent")
-
-    # messages 校验
-    messages = data.get("messages", [])
-    if not isinstance(messages, list):
-        logger.error("messages 非数组，fallback silent")
-        return ParsedResult(action="silent")
-
-    # messages 长度与 action 匹配
-    # reply / multi_reply 均允许 1-10 条（真人连发短消息场景）
-    if action in ("reply", "multi_reply") and not (1 <= len(messages) <= 10):
-        logger.error(f"{action} 需 1-10 条消息，实际 {len(messages)}，fallback silent")
-        return ParsedResult(action="silent")
-    if action in ("silent", "react") and len(messages) != 0:
-        logger.warning(f"{action} 应 0 条消息，实际 {len(messages)}，清空")
-        messages = []
-
-    # 消息段 type 校验
-    # messages 数组每个元素 = 一条消息，支持三种形式：
-    #   - str：纯文本简写，等价于 [{"type":"text","data":{"text":...}}]
-    #   - dict：单段消息简写，等价于 [seg]
-    #   - list：多段混合消息（如 text+face 一条发出），元素为 dict 段
-    cleaned_messages = []
-    for msg in messages:
-        if isinstance(msg, str):
-            cleaned_messages.append(msg)
+    for raw in raw_content.splitlines():
+        line = raw.strip()
+        if not line:
             continue
-        if isinstance(msg, list):
-            # list 形式：一条消息含多段（混合消息）
-            # list 内部元素支持 string（text 简写）和 dict（结构化段）
-            segs = []
-            for seg in msg:
-                if isinstance(seg, str):
-                    seg = {"type": "text", "data": {"text": seg}}
-                cleaned_seg = _validate_segment(seg)
-                if cleaned_seg is not None:
-                    segs.append(cleaned_seg)
-            if segs:
-                cleaned_messages.append(segs)
+        # 容错：模型偶尔会包 markdown 代码块
+        if line.startswith("```"):
+            continue
+
+        # forward 的内容行（紧跟在 forward 之后）
+        if forward_idx is not None:
+            if line.startswith(">"):
+                content = line[1:].strip()
+                if content:
+                    messages[forward_idx][0]["data"]["messages"].append(
+                        {"type": "text", "data": {"text": content}}
+                    )
+                continue
+            close_forward()
+
+        # forward 之外的游离 > 行：无效，丢弃并切断续行
+        if line.startswith(">"):
+            logger.warning(f"forward 之外的 > 行，跳过: {line[:40]}")
+            last_free = None
+            continue
+
+        parsed = _split_command(line)
+        if parsed is None:
+            if _looks_like_command(line):
+                logger.warning(f"未知指令，跳过: {line[:40]}")
+                last_free = None
+            elif last_free == "say" and messages:
+                if messages[-1] and messages[-1][-1].get("type") == "text":
+                    prev = messages[-1][-1]["data"]["text"].rstrip()
+                    messages[-1][-1]["data"]["text"] = prev + " " + line
+                else:
+                    messages[-1].append({"type": "text", "data": {"text": line}})
+            elif last_free in FREE_TEXT_CMDS:
+                result.state[last_free] = (result.state.get(last_free, "") + " " + line).strip()
             else:
-                logger.warning(f"混合消息所有段无效，丢弃: {msg}")
+                logger.warning(f"无法识别的行，跳过: {line[:40]}")
             continue
-        if not isinstance(msg, dict):
-            logger.warning(f"消息非 str/dict/list，丢弃: {msg}")
+
+        cmd, payload = parsed
+        last_free = cmd if cmd in ("say", "note", "cues", "drivers", "inhibitors") else None
+
+        if cmd == "state":
+            keep = {k: result.state[k] for k in FREE_TEXT_CMDS if k in result.state}
+            result.state = _parse_state_line(payload)
+            result.state.update(keep)
+        elif cmd in FREE_TEXT_CMDS:
+            result.state.setdefault("dims", {d: 0.5 for d in STATE_DIMS})
+            limit = 120 if cmd == "cues" else 60
+            result.state[cmd] = payload[:limit]
+        elif cmd == "conversation":
+            result.conversation_mode = payload if payload in ("direct", "open") else "open"
+        elif cmd == "targets":
+            result.targets = [x.strip() for x in payload.split(",") if x.strip()]
+        elif cmd == "delay":
+            try:
+                result.delay_seconds = max(0, min(15, int(payload)))
+            except ValueError:
+                result.delay_seconds = 0
+        elif cmd == "later":
+            try:
+                result.reply_delay_minutes = max(0, min(120, int(payload)))
+            except ValueError:
+                result.reply_delay_minutes = 0
+        elif cmd == "affinity":
+            parts = [x.strip() for x in payload.split(",")]
+            if len(parts) == 2 and parts[0]:
+                try:
+                    result.affinity_delta[parts[0]] = max(-2, min(2, float(parts[1])))
+                except ValueError:
+                    pass
+        elif cmd == "react":
+            parts = [x.strip() for x in payload.split(",")]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                result.react_target_msg_id, result.react_emoji_id = parts
+        elif cmd == "say":
+            segs = _parse_segments(payload)
+            if segs:
+                messages.append(segs)
+        elif cmd == "forward":
+            seg = {"type": "forward", "data": {"title": payload, "messages": []}}
+            messages.append([seg])
+            forward_idx = len(messages) - 1
+
+    close_forward()
+
+    # note/cues 等先于 state 时，state 行会补齐 dims；这里兜底"只有自由文本"的情况
+    if result.state and "dims" not in result.state:
+        result.state["dims"] = {d: 0.5 for d in STATE_DIMS}
+
+    # action 由内容派生（模型不再输出 action）
+    if messages:
+        messages = messages[:10]
+        result.action = "reply" if len(messages) == 1 else "multi_reply"
+        result.reply_delay_minutes = 0
+        result.react_target_msg_id = ""
+        result.react_emoji_id = ""
+    elif result.reply_delay_minutes > 0:
+        result.action = "silent"
+        result.react_target_msg_id = ""
+        result.react_emoji_id = ""
+    elif result.react_target_msg_id and result.react_emoji_id:
+        result.action = "react"
+    else:
+        result.action = "silent"
+    result.messages = messages
+    return result
+
+
+def _split_command(line: str):
+    """固定词表前缀匹配，不用通用正则。返回 (cmd, payload) 或 None。"""
+    for cmd in COMMANDS:
+        if not line.startswith(cmd):
             continue
-        cleaned_seg = _validate_segment(msg)
-        if cleaned_seg is not None:
-            cleaned_messages.append(cleaned_seg)
+        rest = line[len(cmd):]
+        if rest[:1] in (":", "："):
+            return cmd, rest[1:].strip()
+        if rest[:1].isspace():
+            rest = rest.strip()
+            if rest[:1] in (":", "："):
+                rest = rest[1:]
+            return cmd, rest.strip()
+    return None
 
-    # affinity_delta 校验
-    affinity_delta = data.get("affinity_delta", {})
-    if not isinstance(affinity_delta, dict):
-        affinity_delta = {}
-    cleaned_delta = {}
-    for qq, delta in affinity_delta.items():
-        if not isinstance(delta, (int, float)):
+
+def _looks_like_command(line: str) -> bool:
+    """行首是 ASCII 单词 + 冒号，但不是已知指令 → 判定为未知指令。"""
+    for sep in (":", "："):
+        if sep in line:
+            head = line.split(sep, 1)[0].strip()
+            return bool(head) and head.isascii() and head.replace("_", "").isalpha()
+    return False
+
+
+def _parse_state_line(payload: str) -> dict:
+    """解析 state 载荷：逗号/空格分隔的 key=value，dims clip 到 [0,1]。"""
+    s = payload.replace("＝", "=").replace("，", ",")
+    s = re.sub(r"\s*=\s*", "=", s)
+    dims, mode = {}, ""
+    for tok in re.split(r"[,\s]+", s):
+        if not tok:
             continue
-        # clip 到 [-2, +2]
-        cleaned_delta[str(qq)] = max(-2, min(2, delta))
-
-    # delay_seconds 校验
-    delay = data.get("delay_seconds", 0)
-    if not isinstance(delay, (int, float)) or delay < 0:
-        delay = 0
-    delay = min(delay, 15)
-
-    # reply_delay_minutes 校验（延迟回复）
-    # 仅当 action=silent 时有效：表示"已读但稍后回"，不是真的 silent
-    reply_delay = data.get("reply_delay_minutes", 0)
-    if not isinstance(reply_delay, (int, float)) or reply_delay < 0:
-        reply_delay = 0
-    reply_delay = min(int(reply_delay), 120)  # 上限 2 小时，避免过长
-
-    # 语义校验：reply_delay_minutes 仅在 silent 时有意义
-    # 若 action != silent 但有 reply_delay_minutes，忽略（按 reply/react 正常处理）
-    final_reply_delay = reply_delay if action == "silent" else 0
-
-    # react_target_msg_id 校验（非空 str，与 user content 的 [#msg_id] 标记一致）
-    # 仅 action=react 时需要，其他 action 不校验（LLM 无需输出该字段）
-    react_id = data.get("react_target_msg_id", "")
-    if not isinstance(react_id, str):
-        react_id = str(react_id) if react_id else ""
-    if action == "react" and not react_id:
-        logger.warning("react_target_msg_id 为空，react 段将无法定位消息")
-
-    # 阶段 F：conversation_mode 校验（direct=与某人往返对话 / open=开放插话）
-    # 缺失/非法值降级为 open（保守降级，不影响现有逻辑）
-    conversation_mode = data.get("conversation_mode", "open")
-    if conversation_mode not in VALID_CONVERSATION_MODES:
-        logger.warning(f"非法 conversation_mode={conversation_mode}，降级为 open")
-        conversation_mode = "open"
-
-    # 阶段 G：结构化内心状态。仅用于日志观测与后续轮次的自我记忆，
-    # 任何字段非法都降级为默认值，绝不影响 action 判定（不 fallback silent）。
-    state = _parse_state(data.get("state"))
-
-    return ParsedResult(
-        state=state,
-        action=action,
-        targets=data.get("targets", []),
-        messages=cleaned_messages,
-        react_emoji_id=str(data.get("react_emoji_id", "")),
-        react_target_msg_id=react_id,
-        delay_seconds=int(delay),
-        affinity_delta=cleaned_delta,
-        reply_delay_minutes=final_reply_delay,
-        conversation_mode=conversation_mode,
-    )
+        key, sep, val = tok.partition("=")
+        if not sep:
+            continue
+        key, val = key.strip(), val.strip()
+        if key in STATE_DIMS:
+            try:
+                dims[key] = round(max(0.0, min(1.0, float(val))), 2)
+            except ValueError:
+                pass
+        elif key == "mode" and val in VALID_STATE_MODES:
+            mode = val
+    return {"dims": {d: dims.get(d, 0.5) for d in STATE_DIMS}, "mode": mode, "note": ""}
 
 
-def _validate_segment(seg) -> Optional[dict]:
-    """校验单个消息段（dict 形式）。
-
-    Args:
-        seg: 待校验的段，应为 dict
-
-    Returns:
-        校验通过的段 dict，或 None（无效段丢弃）
-    """
-    if not isinstance(seg, dict):
-        logger.warning(f"消息段非 dict，丢弃: {seg}")
-        return None
-    msg_type = seg.get("type", "")
-    if msg_type not in VALID_MSG_TYPES:
-        logger.warning(f"未知消息段 type={msg_type}，丢弃")
-        return None
-    # reply 段：校验 target_msg_id（非空 str，由 sender 配合 history 透传给 NapCat 校验）
-    if msg_type == "reply":
-        data_dict = seg.get("data", {})
-        if not isinstance(data_dict, dict):
-            data_dict = {}
-        target_id = data_dict.get("target_msg_id", "")
-        if not isinstance(target_id, str):
-            target_id = str(target_id) if target_id else ""
-        if not target_id:
-            logger.warning("reply 段 target_msg_id 为空，丢弃 reply 段")
-            return None
-        data_dict["target_msg_id"] = target_id
-        seg["data"] = data_dict
-    return seg
-
-
-def _parse_state(raw_state) -> dict:
-    """解析并规整结构化内心状态（阶段 G）。
-
-    state 只用于日志观测和后续轮次的自我记忆，不参与本轮发送决策。
-    因此所有字段非法时都降级为默认值，绝不因此 fallback silent。
-
-    Returns:
-        规整后的 state dict；raw_state 缺失或非 dict 时返回空 dict
-    """
-    if not isinstance(raw_state, dict):
-        if raw_state is not None:
-            logger.warning(f"state 非 dict，忽略: {type(raw_state)}")
-        return {}
-
-    dims_raw = raw_state.get("dims", {})
-    if not isinstance(dims_raw, dict):
-        dims_raw = {}
-    dims = {}
-    for key in STATE_DIMS:
-        val = dims_raw.get(key)
-        # bool 是 int 的子类，需排除
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            dims[key] = round(max(0.0, min(1.0, float(val))), 2)
+def _parse_segments(payload: str) -> list:
+    """扫描 say 载荷：已知标签转段，其余原样当文本（空白保真）。"""
+    segs, i = [], 0
+    while i < len(payload):
+        j = payload.find("[", i)
+        if j < 0:
+            _add_text(segs, payload[i:])
+            break
+        if j > i:
+            _add_text(segs, payload[i:j])
+        k = payload.find("]", j)
+        if k < 0:  # 没闭合：剩余全部当文本
+            _add_text(segs, payload[j:])
+            break
+        inner = payload[j + 1:k]
+        name, sep, val = inner.partition(":")
+        name = name.strip()
+        if not sep or name not in SEG_TAGS:
+            _add_text(segs, payload[j:k + 1])
         else:
-            dims[key] = 0.5  # 缺失/非法维度按中性值补齐
+            status, seg = _build_segment(name, val.strip())
+            if status == "ok":
+                segs.append(seg)
+        i = k + 1
+    return segs
 
-    def _str_list(value, limit: int) -> list:
-        if not isinstance(value, list):
-            return []
-        items = [str(x).strip() for x in value
-                 if isinstance(x, (str, int, float)) and not isinstance(x, bool)]
-        return [i for i in items if i][:limit]
 
-    activated = []
-    activated_raw = raw_state.get("activated", [])
-    if isinstance(activated_raw, list):
-        for item in activated_raw[:3]:
-            if not isinstance(item, dict):
-                continue
-            rule = str(item.get("rule", "")).strip()
-            if not rule:
-                continue
-            strength = item.get("strength", 0.5)
-            if not isinstance(strength, (int, float)) or isinstance(strength, bool):
-                strength = 0.5
-            activated.append({
-                "rule": rule,
-                "strength": round(max(0.0, min(1.0, float(strength))), 2),
-            })
+def _add_text(segs: list, text: str):
+    """跳过空串；段内空格原样保留（整个 payload 已在切指令时 strip）。"""
+    if text:
+        segs.append({"type": "text", "data": {"text": text}})
 
-    mode = str(raw_state.get("mode", "")).strip()
-    if mode not in VALID_STATE_MODES:
-        mode = ""
 
-    return {
-        "salient_cues": _str_list(raw_state.get("salient_cues"), 3),
-        "activated": activated,
-        "dims": dims,
-        "speak_drivers": _str_list(raw_state.get("speak_drivers"), 2),
-        "speak_inhibitors": _str_list(raw_state.get("speak_inhibitors"), 2),
-        "mode": mode,
-        "note": str(raw_state.get("note", "")).strip()[:60],
-    }
+def _build_segment(name: str, val: str):
+    """构造单个段。返回 (ok/drop/literal, seg)。
+
+    - ok：合法段
+    - drop：已知标签但值非法 → 整段丢弃
+    - literal：未知标签 → 调用方原样当文本
+    """
+    if name == "at":
+        return ("ok", {"type": "at", "data": {"qq": val}}) if val.isdigit() else ("drop", None)
+    if name == "reply":
+        return ("ok", {"type": "reply", "data": {"target_msg_id": val}}) if val else ("drop", None)
+    if name == "face":
+        return ("ok", {"type": "face", "data": {"id": val}}) if val else ("drop", None)
+    if name == "poke":
+        return ("ok", {"type": "poke", "data": {"qq": val}}) if val.isdigit() else ("drop", None)
+    if name in ("img", "video"):
+        if not val:
+            return ("drop", None)
+        typ = "image" if name == "img" else "video"
+        data = {"url": val} if val.startswith(("http://", "https://")) else {"file": val}
+        return ("ok", {"type": typ, "data": data})
+    if name == "voice_ai":
+        return ("ok", {"type": "voice", "data": {"text": val, "channel": "ai_record"}}) if val else ("drop", None)
+    if name == "voice_file":
+        return ("ok", {"type": "voice", "data": {"channel": "local_file", "file": val}}) if val else ("drop", None)
+    if name == "voice_url":
+        return ("ok", {"type": "voice", "data": {"channel": "url", "url": val}}) if val else ("drop", None)
+    return ("literal", None)
