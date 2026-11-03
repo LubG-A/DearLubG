@@ -43,9 +43,13 @@ class LLMClient:
         self.vision = getattr(config, "vision", None)
         md = getattr(config, "media_download", None)
         self.media_temp_dir = md.temp_dir if md else "media/downloaded"
+        # 对话前缀续写使用 DeepSeek Beta 接口（普通接口不接受 prefix 字段）
+        prefix_cfg = getattr(config, "prefix", None)
+        self.prefix_api_url = prefix_cfg.beta_api_url if prefix_cfg else ""
 
     def chat(self, system_prompt: str, history_messages: list[dict], new_user_content: str,
-             images: Optional[list[dict]] = None) -> Optional[str]:
+             images: Optional[list[dict]] = None,
+             assistant_prefix: Optional[str] = None) -> Optional[str]:
         """调用大模型，返回 assistant 的原始字符串内容。
 
         单次调用失败时重试 1 次（间隔 2 秒），两次都失败才返回 None。
@@ -56,6 +60,8 @@ class LLMClient:
             new_user_content: 本轮新增的 user 内容（群消息批次）
             images: 本轮消息中的图片源列表（NapCat image 段 data），
                     按 DeepSeek 多模态格式插入 user content 的 image_url 块。
+            assistant_prefix: 对话前缀续写（/pf）。非空时作为最后一条 assistant
+                             消息（prefix=True）发给 Beta 接口，返回值为"前缀+续写"。
 
         Returns:
             LLM 返回的原始字符串内容（行指令文本），失败返回 None
@@ -70,6 +76,13 @@ class LLMClient:
         messages.extend(history_messages)
         messages.append({"role": "user", "content": self._build_user_content(new_user_content, images)})
 
+        url = self.api_url
+        if assistant_prefix:
+            # DeepSeek 对话前缀续写：最后一条必须是 assistant，并标记 prefix=True
+            messages.append({"role": "assistant", "content": assistant_prefix, "prefix": True})
+            url = self._prefix_url()
+            logger.info(f"使用 /pf 前缀续写：前缀 {len(assistant_prefix)} 字，接口 {url}")
+
         payload = {
             "model": self.model,
             "messages": messages,
@@ -78,11 +91,16 @@ class LLMClient:
         # 最多重试 2 次（共 2 次请求）
         for attempt in range(2):
             try:
-                resp = requests.post(self.api_url, headers=headers, json=payload, timeout=300)
+                resp = requests.post(url, headers=headers, json=payload, timeout=300)
                 resp.raise_for_status()
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 logger.debug(f"LLM 返回: {content[:200]}")
+                if assistant_prefix:
+                    # 接口只返回续写部分；拼回前缀，后续 parser 才能看到完整行指令
+                    if content.startswith(assistant_prefix):
+                        return content
+                    return assistant_prefix + content
                 return content
             except requests.RequestException as e:
                 if attempt == 0:
@@ -94,6 +112,14 @@ class LLMClient:
                 logger.error(f"LLM 响应解析失败: {e}")
                 return None
         return None
+
+    def _prefix_url(self) -> str:
+        """解析前缀续写接口地址：优先配置，否则在普通 URL 中插入 /beta。"""
+        if self.prefix_api_url:
+            return self.prefix_api_url
+        if "/chat/completions" in self.api_url:
+            return self.api_url.replace("/chat/completions", "/beta/chat/completions", 1)
+        return self.api_url
 
     def _build_user_content(self, new_user_content: str, images: Optional[list[dict]]):
         """把图片源转成 OpenAI/DeepSeek 兼容的 content block 数组。

@@ -43,6 +43,7 @@ from src.llm_client import LLMClient
 from src.affinity import AffinityManager
 from src.persona import PersonaRenderer
 from src.parser import parse_and_validate
+from src.prefix import build_assistant_prefix, extract_prefix_command
 from src.senders.message_sender import NapCatMessageSender
 from src.senders.voice_sender import AIRecordVoiceSender, LocalFileVoiceSender, UrlVoiceSender
 from src.senders.image_sender import NapCatImageSender
@@ -310,6 +311,37 @@ class Bot:
         active_cfg = getattr(private_cfg, "active_trigger", None) if private_cfg else None
         return bool(private_cfg and private_cfg.enabled and active_cfg and active_cfg.enabled)
 
+    def _prefix_settings(self) -> tuple[bool, str]:
+        """对话前缀续写开关与指令词。"""
+        cfg = getattr(self.config, "prefix", None)
+        if not cfg or not cfg.enabled:
+            return False, ""
+        return True, cfg.command or "/pf"
+
+    def _take_prefix_from_content(self, ctx: ChatContext, content: str, chat_type: str):
+        """提取消息里的 /pf 指令并写入 ctx，返回剥离指令后的消息文本。
+
+        Returns:
+            (清洗后的 content, 是否命中了 /pf)
+        """
+        enabled, command = self._prefix_settings()
+        if not enabled:
+            return content, False
+        text, payload = extract_prefix_command(content, command)
+        if payload is None:
+            return content, False
+        try:
+            prefix = build_assistant_prefix(payload, chat_type=chat_type)
+        except Exception as e:
+            # 前缀解析失败不应阻塞正常消息处理，按普通文本继续
+            logger.error(f"{ctx.chat_key} {command} 前缀解析失败: {e}", exc_info=True)
+            return content, False
+        ctx.set_assistant_prefix(prefix)
+        if not text.strip():
+            text = "（用 /pf 指定了回复开头）"
+        logger.info(f"{ctx.chat_key} 收到 {command} 前缀续写，assistant 前缀 {len(prefix)} 字")
+        return text, True
+
     def on_private_message(self, msg: dict):
         """处理收到的私聊消息（接收线程）。
 
@@ -328,10 +360,12 @@ class Bot:
             content, images, has_voice = self._extract_incoming_content(msg)
             msg_id = str(msg.get("message_id", ""))
 
+            ctx = self._get_or_create_private_ctx(user_qq, sender_nick)
+            # 对话前缀续写：/pf 指令写入 ctx，消息文本剥离指令
+            content, is_prefix = self._take_prefix_from_content(ctx, content, "private")
+
             if has_voice:
                 content = (content + (" " if content else "") + "[语音消息]").strip()
-
-            ctx = self._get_or_create_private_ctx(user_qq, sender_nick)
 
             # 入 fast_buffer（与 bot 回复共用入口，保持真实发言顺序）
             ctx.history.append_group_message(user_qq, sender_nick, content, msg_id, images=images)
@@ -346,8 +380,12 @@ class Bot:
             if has_voice and msg_id:
                 threading.Thread(target=self._transcribe_voice_async, args=(ctx, msg_id), daemon=True).start()
 
-            # 私聊是 1v1：所有对方发言都走 direct 回复倒计时（停口后再回，合并连发）
-            self._maybe_arm_direct_countdown(ctx, new_speech=True)
+            if is_prefix:
+                # /pf 是显式指令：立即看一眼（冷却中会自动转为回复倒计时）
+                self._try_trigger_private(ctx)
+            else:
+                # 私聊是 1v1：所有对方发言都走 direct 回复倒计时（停口后再回，合并连发）
+                self._maybe_arm_direct_countdown(ctx, new_speech=True)
         except Exception as e:
             logger.error(f"处理私聊消息异常: {e}", exc_info=True)
 
@@ -417,6 +455,8 @@ class Bot:
             sender_nick = self.napcat.get_nickname(msg_group_id, sender_qq)
             content, images, has_voice = self._extract_incoming_content(msg)
             msg_id = str(msg.get("message_id", ""))
+            # 对话前缀续写：/pf 指令写入 ctx，消息文本剥离指令
+            content, is_prefix = self._take_prefix_from_content(ctx, content, "group")
 
             # 语音消息：先用占位入历史（不阻塞），独立线程延迟重试转写后回填
             # NapCat 收到语音需先从腾讯下载 amr 文件，立即调用 fetch_ptt_text 会因文件未就绪而失败
@@ -440,25 +480,29 @@ class Bot:
                 threading.Thread(target=self._transcribe_voice_async, args=(ctx, msg_id), daemon=True).start()
 
             # 2. 评分（接收线程，只读）
-            score, soft_factors = ctx.trigger_evaluator.evaluate(msg)
-            is_hard = self._is_hard_trigger(ctx, msg, content)
-            logger.debug(f"消息评分={score} hard={is_hard} soft_factors={[f.name for f in soft_factors]}")
-
-            # 3. 触发决策（按优先级：硬因子 > direct 倒计时 > 软因子 > 静默兜底）
-            if is_hard:
+            # /pf 是显式指令，直接硬触发，不参与评分/归因
+            if is_prefix:
                 self._try_trigger_immediate(ctx, hard=True)
             else:
-                # 阶段 F：direct 目标的发言。P003 v2.4 起不再立即触发，改为武装/重置回复倒计时，
-                # 等 target 停口后再回（避免用户连发时一条一回）
-                now_ts = time.time()
-                direct_deadline = ctx.direct_targets.get(sender_qq)
-                if direct_deadline is not None and direct_deadline > now_ts:
-                    # 续命：重置该 target 的 deadline
-                    ctx.direct_targets[sender_qq] = now_ts + DIRECT_WINDOW_SECONDS
-                    self._maybe_arm_direct_countdown(ctx, new_speech=True)
-                elif ctx.trigger_evaluator.should_peek(score):
-                    self._try_trigger_immediate(ctx, hard=False, soft_factors=soft_factors)
-                # 低分消息不立即触发，等静默窗口兜底
+                score, soft_factors = ctx.trigger_evaluator.evaluate(msg)
+                is_hard = self._is_hard_trigger(ctx, msg, content)
+                logger.debug(f"消息评分={score} hard={is_hard} soft_factors={[f.name for f in soft_factors]}")
+
+                # 3. 触发决策（按优先级：硬因子 > direct 倒计时 > 软因子 > 静默兜底）
+                if is_hard:
+                    self._try_trigger_immediate(ctx, hard=True)
+                else:
+                    # 阶段 F：direct 目标的发言。P003 v2.4 起不再立即触发，改为武装/重置回复倒计时，
+                    # 等 target 停口后再回（避免用户连发时一条一回）
+                    now_ts = time.time()
+                    direct_deadline = ctx.direct_targets.get(sender_qq)
+                    if direct_deadline is not None and direct_deadline > now_ts:
+                        # 续命：重置该 target 的 deadline
+                        ctx.direct_targets[sender_qq] = now_ts + DIRECT_WINDOW_SECONDS
+                        self._maybe_arm_direct_countdown(ctx, new_speech=True)
+                    elif ctx.trigger_evaluator.should_peek(score):
+                        self._try_trigger_immediate(ctx, hard=False, soft_factors=soft_factors)
+                    # 低分消息不立即触发，等静默窗口兜底
 
             # 4. 重置静默定时器（无论硬软，新消息都推迟兜底触发）
             self._reschedule_quiet_trigger(ctx)
@@ -1001,11 +1045,16 @@ class Bot:
             pending_images = ctx.history.collect_pending_images()
             if pending_images:
                 logger.info(f"{ctx.chat_key} 本轮携带 {len(pending_images)} 张图片进入识图")
+            assistant_prefix = ctx.take_assistant_prefix()
             raw_result = self.llm.chat(
-                system_prompt, history_messages, new_user_content, images=pending_images
+                system_prompt, history_messages, new_user_content, images=pending_images,
+                assistant_prefix=assistant_prefix or None,
             )
             if raw_result is None:
                 logger.warning("LLM 调用失败，本轮跳过")
+                # 前缀未成功使用，放回 ctx 供下次触发重试
+                if assistant_prefix:
+                    ctx.set_assistant_prefix(assistant_prefix)
                 # pending 留待下次触发再拼入（消息不丢失）
                 if self._consume_pending_trigger(ctx):
                     continue
