@@ -52,6 +52,16 @@ class ChatContext:
         self._countdown_resets: int = 0
         self._countdown_gen: int = 0
 
+        # 打断模式（P005）
+        # _send_interrupt：发送窗口（含 LLM 调用期间）到达新内容时置位；LLM 线程在发送前检查
+        # _interrupt_sender：触发打断的发言者昵称（用于下一轮提示）
+        # _unsent_intent：被打断、尚未发出的计划，下一轮注入 user content
+        # _interrupt_streak：连续"完整打断"次数，达到上限后强制发出一次，防止被饿死
+        self._send_interrupt = threading.Event()
+        self._interrupt_sender: str = ""
+        self._unsent_intent: Optional[dict] = None
+        self._interrupt_streak: int = 0
+
     @property
     def chat_key(self) -> str:
         """全局唯一 chat key，用于 cycle 队列。"""

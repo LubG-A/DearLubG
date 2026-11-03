@@ -12,6 +12,11 @@
 - 倒计时期间 target 每有新的发言就重置，最多重置 DIRECT_COUNTDOWN_MAX_RESETS 次
 - 目的：把用户连发合并成一次回复，而不是"一条一回"
 
+打断模式（P005）：
+- direct target（私聊为对方）在 LLM 调用/发送期间发新内容时置位 _send_interrupt
+- 未发出的消息全部停发，存入 _unsent_intent；下一轮 user content 注入"# 被打断的发言"
+- 已发出的不撤回；连续完整打断 INTERRUPT_STREAK_LIMIT 次后强制发出一次
+
 并发模型（B2 方案）：
 - 接收线程（webhook）只写 fast_buffer（HistoryManager 内 _buffer_lock 保护，持锁极短）
 - LLM 工作线程用 _cycle_running 标志保证串行，LLM 调用和发送不持锁
@@ -58,6 +63,7 @@ QUIET_WINDOW_SECONDS = 150       # 静默窗口：N 秒无新消息后兜底触�
 DIRECT_WINDOW_SECONDS = 90      # 阶段 F：direct 模式活跃窗口，target 在此窗口内发言触发快速触发
 DIRECT_REPLY_COUNTDOWN_SECONDS = 9  # P003 v2.4：direct 回复倒计时，target 停口 N 秒后才回
 DIRECT_COUNTDOWN_MAX_RESETS = 9      # P003 v2.4：倒计时最多被 target 新发言重置的次数
+INTERRUPT_STREAK_LIMIT = 5           # P005：连续完整打断 N 次后，下一次忽略打断强制发出
 QUOTED_MESSAGE_MAX_CHARS = 500  # 引用消息原文最大字符数，避免上下文膨胀
 
 
@@ -291,9 +297,11 @@ class Bot:
 
             # 入 fast_buffer（与 bot 回复共用入口，保持真实发言顺序）
             ctx.history.append_group_message(user_qq, sender_nick, content, msg_id, images=images)
-            # P003 v2.4：私聊 cycle 正在跑 -> 打标记
+            # P003 v2.4 / P005：私聊 cycle 正在跑 -> 打标记并打断尚未发出的消息
             if ctx._cycle_active:
                 ctx._backlog_pending = True
+                ctx._send_interrupt.set()
+                ctx._interrupt_sender = sender_nick
 
             # 语音转写：异步延迟重试，成功后回填历史 content
             if has_voice and msg_id:
@@ -381,6 +389,11 @@ class Bot:
             # P003 v2.4：本群 cycle 正在跑 -> 这条消息是"Bot 输出期间到达的欠账"，先打标记
             if ctx._cycle_active:
                 ctx._backlog_pending = True
+                # P005 打断：direct target 在本轮输出期间发新内容 -> 打断尚未发出的消息
+                deadline = ctx.direct_targets.get(sender_qq)
+                if deadline is not None and deadline > time.time():
+                    ctx._send_interrupt.set()
+                    ctx._interrupt_sender = sender_nick
 
             # 语音转写：异步延迟重试，成功后回填历史 content
             if has_voice and msg_id:
@@ -880,6 +893,9 @@ class Bot:
             # drain 之后仍留在 fast_buffer 的才是"本轮输出期间到达、LLM 没看过"的欠账；
             # 先清掉旧标记，之后到达的消息会由接收线程重新置位
             ctx._backlog_pending = False
+            # 同一位置清空打断信号：本轮 LLM 调用/发送期间新到达的消息会重新置位
+            ctx._send_interrupt.clear()
+            ctx._interrupt_sender = ""
 
             # 2. 延迟回复到期
             due_count = ctx.history.pop_due_delayed_into_pending()
@@ -904,6 +920,7 @@ class Bot:
             new_user_content = self.persona_renderer.render_user_content(
                 pending_text, member_list, self.self_nickname, self.self_qq,
                 is_active=is_active, chat_type=ctx.chat_type, peer=self._private_peer(ctx),
+                interrupted_intent=self._format_unsent_intent(ctx),
             )
 
             # 5. 调用 LLM（不持锁，_cycle_running 标志保证串行）
@@ -940,6 +957,8 @@ class Bot:
             # 清空 pending（user_content 已在步骤 4 构建，不重新 build）
             ctx.history.consume_pending_into_user()
             ctx.history.append_turn(new_user_content, raw_result)
+            # 未发出的计划已注入本轮 user content，消费完毕
+            ctx._unsent_intent = None
 
             # 7. 发送 + 归因（不持锁，发送期间群消息和 bot 回复都进 fast_buffer）
             self._handle_result(ctx, parsed, soft_factors)
@@ -975,7 +994,11 @@ class Bot:
         }
 
     def _handle_result(self, ctx: ChatContext, parsed, soft_factors):
-        """处理 LLM 结果：执行动作 -> 写回历史 -> 亲密度 -> 归因。
+        """处理 LLM 结果：执行动作 -> 发送（可被打断）-> 写回历史 -> 亲密度 -> 归因。
+
+        P005 打断模式：direct target（私聊为对方）在本轮 LLM 调用/发送期间发新内容时，
+        停止尚未发出的消息，把未发出的计划存到 ctx._unsent_intent，下一轮重新组织语言。
+        已发出的消息不撤回，也不重新发送；未发出的部分交给 LLM 自行决定继续说还是换话题。
 
         Args:
             ctx: 聊天上下文（群聊/私聊）
@@ -983,15 +1006,15 @@ class Bot:
             soft_factors: 触发评分软因子（主动触发/私聊时为 None，归因跳过）
         """
         # 延迟：delay_seconds 叠加 0.3-1.2 秒/字的随机抖动（模拟"打字中"）
+        total_delay = 0.0
         if parsed.delay_seconds > 0 or parsed.messages:
             total_text_len = sum(len(_msg_to_text(m)) for m in parsed.messages)
             jitter = random.uniform(0.3, 1.2) * max(1, total_text_len // 5)  # 每5字一抖动段
             total_delay = parsed.delay_seconds + min(jitter, 8.0)  # 抖动上限 8 秒
-            if total_delay > 0:
-                logger.debug(f"延迟发送 {total_delay:.1f}s (delay={parsed.delay_seconds} jitter={jitter:.1f})")
-                time.sleep(total_delay)
 
         if parsed.action == "silent":
+            if total_delay > 0:
+                time.sleep(total_delay)
             # 不发送，但仍更新归因（主动触发/私聊时 soft_factors=None，跳过）
             if soft_factors is not None:
                 ctx.attribution.update(soft_factors, "silent")
@@ -1002,6 +1025,8 @@ class Bot:
             return
 
         if parsed.action == "react":
+            if total_delay > 0:
+                time.sleep(total_delay)
             # 调用 /set_msg_emoji_like 给目标消息加 emoji 反应
             msg_id = ctx.history.get_msg_id_by_id(parsed.react_target_msg_id)
             if not msg_id:
@@ -1018,10 +1043,55 @@ class Bot:
                 self._cleanup_expired_direct_targets(ctx)
             return
 
-        # reply / multi_reply
-        # _send_messages 内部每条发送完成后会逐条 append 到 fast_buffer（is_bot=True），
+        # ---------- reply / multi_reply：可被打断 ----------
+        # 连续完整打断达到上限后，本次忽略打断、强制发出，避免对方一直打字导致 Bot 永不开口
+        allow_interrupt = ctx._interrupt_streak < INTERRUPT_STREAK_LIMIT
+
+        # 1) LLM 调用期间/进入本函数前已经到达的打断：整批都不发
+        if allow_interrupt and ctx._send_interrupt.is_set():
+            self._record_unsent_intent(ctx, parsed, 0, parsed.messages)
+            ctx._interrupt_streak += 1
+            ctx._send_interrupt.clear()
+            logger.info(f"{ctx.chat_key} 发送前被打断：整批 {len(parsed.messages)} 条未发出，进入下一轮")
+            return
+
+        # 2) 发送前延迟（可被新消息提前唤醒）
+        if total_delay > 0:
+            logger.debug(f"延迟发送 {total_delay:.1f}s (delay={parsed.delay_seconds})")
+            if allow_interrupt:
+                if ctx._send_interrupt.wait(total_delay):
+                    self._record_unsent_intent(ctx, parsed, 0, parsed.messages)
+                    ctx._interrupt_streak += 1
+                    ctx._send_interrupt.clear()
+                    logger.info(f"{ctx.chat_key} 延迟期间被打断：整批 {len(parsed.messages)} 条未发出，进入下一轮")
+                    return
+            else:
+                time.sleep(total_delay)
+
+        # 3) 发送（multi_reply 的条间间隔同样可被打断）
+        # 每条发送完成后会逐条 append 到 fast_buffer（is_bot=True），
         # 与此期间群成员的新消息按真实 append 顺序混合，下一轮 drain 时进入 pending。
-        self._send_messages(ctx, parsed.messages)
+        sent_count, unsent = self._send_messages(ctx, parsed.messages, allow_interrupt=allow_interrupt)
+        if unsent:
+            self._record_unsent_intent(ctx, parsed, sent_count, unsent)
+            if sent_count == 0:
+                logger.info(f"{ctx.chat_key} 发送中断：0 条已发，{len(unsent)} 条进入下一轮")
+            else:
+                logger.info(f"{ctx.chat_key} 发送中断：已发 {sent_count} 条，"
+                            f"{len(unsent)} 条未发内容进入下一轮")
+            # 只统计"完整打断"（一条都没发出的连续次数）
+            ctx._interrupt_streak = ctx._interrupt_streak + 1 if sent_count == 0 else 0
+        else:
+            ctx._interrupt_streak = 0
+        ctx._send_interrupt.clear()
+        if not unsent:
+            ctx._interrupt_sender = ""
+
+        if sent_count == 0:
+            # 整批被打断：不更新冷却/亲密度/归因/direct 状态，
+            # 保留现有 direct 窗口与倒计时，让下一轮重规划能正常触发
+            return
+
         ctx.last_reply_time = time.time()
 
         # 亲密度更新
@@ -1031,12 +1101,44 @@ class Bot:
         if soft_factors is not None:
             ctx.attribution.update(soft_factors, parsed.action)
 
-        # 阶段 F：根据 LLM 输出更新 direct 状态（仅群聊）
-        # - conversation_mode=direct + targets 至少一个可解析 → 为每个 target 设置 deadline
-        # - conversation_mode=open 或 targets 全部不可解析 → 清空 direct_targets
-        # - silent/react 已在上面处理（保留 direct 状态）
-        if ctx.chat_type == "group":
+        # P005：只有完整发出时才更新 direct 状态；部分打断时保留现有 direct 窗口/倒计时，
+        # 让下一轮重规划继续（尤其避免 LLM 输出 open 把倒计时取消掉）
+        if not unsent and ctx.chat_type == "group":
             self._update_direct_state(ctx, parsed)
+
+    def _record_unsent_intent(self, ctx: ChatContext, parsed, sent_count: int, unsent: list):
+        """记录被打断、尚未发出的计划，供下一轮 user content 注入。"""
+        if not unsent:
+            return
+        ctx._unsent_intent = {
+            "messages": list(unsent),
+            "sent_count": sent_count,
+            "planned_count": len(parsed.messages),
+            "sender": ctx._interrupt_sender or "",
+        }
+        ctx._interrupt_sender = ""
+
+    def _format_unsent_intent(self, ctx: ChatContext) -> str:
+        """把未发出的计划渲染成 user content 里的一节（空则返回空串）。"""
+        intent = ctx._unsent_intent
+        if not intent:
+            return ""
+        unsent = intent.get("messages", [])
+        if not unsent:
+            return ""
+        sender = intent.get("sender") or "对方"
+        sent_count = intent.get("sent_count", 0)
+        if sent_count <= 0:
+            lines = ["你上一轮一条都没发出；原本准备发的内容如下："]
+        else:
+            lines = [f"你上一轮已经发出了前 {sent_count} 条；"
+                     f"原本还准备继续发、但没有真的发到群里："]
+        for m in unsent:
+            lines.append(f"- {_msg_to_text(m)}")
+        lines.append(f"你正要发的时候，{sender}又发了新内容（见下方最近消息）。")
+        lines.append("请结合你原本想表达的意思和新内容重新组织语言：原计划还合适就接着说，"
+                     "不合适就改说法；没话说就 silent。")
+        return "\n".join(lines)
 
     def _update_direct_state(self, ctx: GroupContext, parsed):
         """阶段 F：根据 LLM 输出更新 direct 状态。
@@ -1216,16 +1318,35 @@ class Bot:
         except Exception as e:
             logger.error(f"{ctx.chat_key} direct 回复倒计时异常: {e}", exc_info=True)
 
-    def _send_messages(self, ctx: ChatContext, messages: list):
-        """发送消息列表，带间隔。
+    def _send_messages(self, ctx: ChatContext, messages: list, allow_interrupt: bool = True) -> tuple[int, list]:
+        """发送消息列表，带间隔；支持 P005 打断。
 
         每条消息发送完成后立即 append 到 fast_buffer（is_bot=True），
         与此期间接收线程写入的群消息按真实 append 顺序混合，
         保证下一轮 LLM 看到的发言顺序 = 真实群聊发言顺序。
         multi_reply 逐条 append，中间间隔期间群成员插话会自然夹在 bot 消息之间。
+
+        Args:
+            messages: LLM 输出的消息计划
+            allow_interrupt: 是否允许在发送过程中被 direct target 的新发言打断
+
+        Returns:
+            (sent_count, unsent_messages)
+            sent_count: 实际成功发出的条数；unsent_messages: 因打断而未发出的剩余计划
         """
-        segments_list = self.message_sender.build_segments(messages, ctx.history)
-        for i, segs in enumerate(segments_list):
+        # 预先配对"原始 message -> 消息段"，避免 build_segments 丢弃空消息导致下标错位
+        pairs = []
+        for msg in messages:
+            segs_list = self.message_sender.build_segments([msg], ctx.history)
+            if segs_list:
+                pairs.append((msg, segs_list[0]))
+
+        sent_count = 0
+        for i, (msg, segs) in enumerate(pairs):
+            # 发送前检查打断（已在发送窗口内）
+            if allow_interrupt and ctx._send_interrupt.is_set():
+                return sent_count, [m for m, _ in pairs[i:]]
+
             # 处理特殊段
             handled = False
             sent_ok = True  # 特殊段发送是否成功；失败时不 append 到 fast_buffer（保持历史事实性）
@@ -1261,24 +1382,31 @@ class Bot:
             if handled:
                 if sent_ok:
                     # 特殊段记入 fast_buffer（语音/图片/视频/转发都算一条 bot 发言）
-                    self._append_bot_reply_to_buffer(ctx, messages[i])
+                    self._append_bot_reply_to_buffer(ctx, msg)
+                    sent_count += 1
                 else:
                     logger.warning("特殊段发送失败，不记录到历史（保持历史事实性）")
-                continue
+            else:
+                # 普通消息段（私聊不需要 @，过滤 at 段避免意外 @ 对方）
+                normal_segs = [s for s in segs if s.get("type") not in ("forward", "image", "video", "voice")]
+                if ctx.chat_type == "private":
+                    normal_segs = [s for s in normal_segs if s.get("type") != "at"]
+                if normal_segs:
+                    self.message_sender.send(ctx.chat_type, ctx.chat_id, normal_segs)
+                # 逐条 append 到 fast_buffer（与群消息按真实时间顺序混合）
+                self._append_bot_reply_to_buffer(ctx, msg)
+                sent_count += 1
 
-            # 普通消息段（私聊不需要 @，过滤 at 段避免意外 @ 对方）
-            normal_segs = [s for s in segs if s.get("type") not in ("forward", "image", "video", "voice")]
-            if ctx.chat_type == "private":
-                normal_segs = [s for s in normal_segs if s.get("type") != "at"]
-            if normal_segs:
-                self.message_sender.send(ctx.chat_type, ctx.chat_id, normal_segs)
+            # 多条消息间隔（可被新发言提前唤醒）
+            if i < len(pairs) - 1:
+                gap = random.uniform(0.8, 2.5)
+                if allow_interrupt:
+                    if ctx._send_interrupt.wait(gap):
+                        return sent_count, [m for m, _ in pairs[i + 1:]]
+                else:
+                    time.sleep(gap)
 
-            # 逐条 append 到 fast_buffer（与群消息按真实时间顺序混合）
-            self._append_bot_reply_to_buffer(ctx, messages[i])
-
-            # 多条消息间隔
-            if i < len(segments_list) - 1:
-                time.sleep(random.uniform(0.8, 2.5))
+        return sent_count, []
 
     def _append_bot_reply_to_buffer(self, ctx: ChatContext, msg):
         """把单条 bot 发言追加到 fast_buffer（is_bot=True）。
@@ -1380,6 +1508,8 @@ def _msg_to_text(msg) -> str:
             return f"[face:{d.get('id', '')}]"
         if t == "image":
             return "[图片]"
+        if t == "reply":
+            return f"[引用回复]{d.get('text', '')}"
         if t == "voice":
             return f"[语音:{d.get('text', '')}]"
         return f"[{t}]"

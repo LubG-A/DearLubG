@@ -337,7 +337,6 @@ say 里可以用段标签（只有这些）：
 [reply:msg_id] [face:id] [poke:QQ]
 [img:路径或URL] [video:路径或URL]
 [voice_ai:文字] [voice_file:路径] [voice_url:URL]
-私聊没有 [at:QQ]。
 
 规则：
 - 特殊段（img/video/voice/forward）单独占一行，不要和文字混在同一句 say。
@@ -399,15 +398,21 @@ say 里可以用段标签（只有这些）：
         return prompt
 
     def render_user_content(self, history_context: str, member_list: list, my_nickname: str, my_qq: str,
-                            is_active: bool = False, chat_type: str = "group", peer: dict = None) -> str:
+                            is_active: bool = False, chat_type: str = "group", peer: dict = None,
+                            interrupted_intent: str = "") -> str:
         """渲染 user 消息内容（上下文 + 成员/对方 + 最近消息）。
 
         Args:
             is_active: 是否为主动触发（无新群消息，LLM 自主决定要不要主动开口）
             chat_type: "group" 渲染群成员列表；"private" 只渲染对方信息
             peer: 私聊对方信息 {qq, nickname, affinity}
+            interrupted_intent: P005：上一轮被打断、未发出的计划说明（空则不渲染该节）
         """
         now = datetime.now().strftime("%Y-%m-%d %H:%M %A")
+        intent_block = (
+            f"# 被打断的发言\n{interrupted_intent.strip()}\n\n"
+            if interrupted_intent.strip() else ""
+        )
 
         if chat_type == "private":
             peer = peer or {}
@@ -421,7 +426,7 @@ say 里可以用段标签（只有这些）：
 - 状态：私聊（一对一）
 - 对方：{peer_nick}({peer_qq}) 亲密度={affinity}
 
-# 最近消息（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
+{intent_block}# 最近消息（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
 {messages_section}
 
 请按行指令输出。"""
@@ -453,7 +458,7 @@ say 里可以用段标签（只有这些）：
 - 群成员（昵称/QQ/角色/亲密度）：
 {member_str}
 
-# 最近群消息（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
+{intent_block}# 最近群消息（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
 {messages_section}
 
 请按行指令输出。"""
