@@ -1,7 +1,8 @@
-"""主动触发调度器（阶段 D：per-group 实例，移入 GroupContext）。
+"""主动触发调度器（群聊 / 私聊共用）。
 
-每群持有一个 ActiveScheduler 实例，独立 Timer，独立状态文件（state/{group_id}/scheduler.json）。
-间隔沿用原有随机 min-max 逻辑，深夜（23:00-3:00）禁用主动触发。
+每个 chat（群或私聊对象）持有一个 ActiveScheduler 实例，独立 Timer，
+独立状态文件（群聊 state/{group_id}/scheduler.json，私聊 state/private/{qq}/scheduler.json）。
+间隔沿用随机 min-max 逻辑，深夜禁用主动触发。
 
 状态持久化：跨重启保留 last_active_check_time 和 next_active_check_time。
 """
@@ -13,21 +14,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
-from .config import Config
+from .config import ActiveTriggerConfig, Config
 from .utils.logger import get_logger
 
 logger = get_logger("scheduler")
 
 
 class ActiveScheduler:
-    """per-group 主动触发调度器。"""
+    """per-chat 主动触发调度器。"""
 
-    def __init__(self, config: Config, group_id: str, state_dir: str = "state"):
+    def __init__(self, config: Config, group_id: str, state_dir: str = "state",
+                 active_config: Optional[ActiveTriggerConfig] = None, label: str = ""):
         self.config = config
         self.group_id = group_id
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.state_dir / "scheduler.json"
+        # 主动触发参数：群聊默认用全局 active_trigger，私聊可传自己的配置
+        self.active_config = active_config or config.active_trigger
+        self.label = label or f"群 {group_id}"
 
         # 状态
         self.last_active_check_time: Optional[datetime] = None
@@ -67,7 +72,7 @@ class ActiveScheduler:
 
         在 [min, max] 区间内随机取分钟数，跳过深夜时段。
         """
-        cfg = self.config.active_trigger
+        cfg = self.active_config
         interval = random.randint(cfg.min_interval_minutes, cfg.max_interval_minutes)
         now = datetime.now()
         next_time = now + timedelta(minutes=interval)
@@ -98,8 +103,8 @@ class ActiveScheduler:
         if self._stop_event.is_set():
             return
 
-        if not self.config.active_trigger.enabled:
-            logger.debug("主动触发已禁用")
+        if not self.active_config.enabled:
+            logger.debug(f"{self.label} 主动触发已禁用")
             return
 
         self.next_active_check_time = self._generate_next_check_time()
@@ -112,7 +117,7 @@ class ActiveScheduler:
             # 已过期，立即触发（加小延迟避免密集调用）
             wait_seconds = 5
 
-        logger.info(f"群 {self.group_id} 下次主动触发：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}（{wait_seconds/60:.1f} 分钟后）")
+        logger.info(f"{self.label} 下次主动触发：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}（{wait_seconds/60:.1f} 分钟后）")
 
         # 取消旧定时器
         if self._timer:
@@ -130,7 +135,7 @@ class ActiveScheduler:
 
         # 再次检查是否在深夜（防止时间漂移）
         now = datetime.now()
-        cfg = self.config.active_trigger
+        cfg = self.active_config
         hour = now.hour
         if cfg.night_start_hour > cfg.night_end_hour:
             in_night = hour >= cfg.night_start_hour or hour < cfg.night_end_hour
@@ -138,11 +143,11 @@ class ActiveScheduler:
             in_night = cfg.night_end_hour <= hour < cfg.night_start_hour
 
         if in_night:
-            logger.info(f"群 {self.group_id} 当前为深夜，跳过本次主动触发，重新调度")
+            logger.info(f"{self.label} 当前为深夜，跳过本次主动触发，重新调度")
             self._schedule_next()
             return
 
-        logger.info(f"群 {self.group_id} 主动触发定时器到期，执行回调")
+        logger.info(f"{self.label} 主动触发定时器到期，执行回调")
         self.last_active_check_time = now
         self._save()
 
@@ -150,7 +155,7 @@ class ActiveScheduler:
             if self._callback:
                 self._callback(self.group_id)
         except Exception as e:
-            logger.error(f"群 {self.group_id} 主动触发回调异常: {e}", exc_info=True)
+            logger.error(f"{self.label} 主动触发回调异常: {e}", exc_info=True)
         finally:
             # 安排下一次
             self._schedule_next()
@@ -171,11 +176,11 @@ class ActiveScheduler:
         # 否则生成新的
         now = datetime.now()
         if self.next_active_check_time and self.next_active_check_time > now:
-            logger.info(f"群 {self.group_id} 恢复调度器计划：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"{self.label} 恢复调度器计划：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
             self.next_active_check_time = self._generate_next_check_time()
             self._save()
-            logger.info(f"群 {self.group_id} 生成新调度计划：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"{self.label} 生成新调度计划：{self.next_active_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         wait_seconds = (self.next_active_check_time - now).total_seconds()
         if wait_seconds <= 0:
@@ -191,7 +196,7 @@ class ActiveScheduler:
         if self._timer:
             self._timer.cancel()
             self._timer = None
-        logger.info(f"群 {self.group_id} 调度器已停止")
+        logger.info(f"{self.label} 调度器已停止")
 
     def is_active_check_time(self) -> bool:
         """当前是否为主动触发状态（供 main.py 判断）。"""
@@ -203,5 +208,5 @@ class ActiveScheduler:
         return {
             "last_active_check_time": self.last_active_check_time.isoformat() if self.last_active_check_time else None,
             "next_active_check_time": self.next_active_check_time.isoformat() if self.next_active_check_time else None,
-            "enabled": self.config.active_trigger.enabled,
+            "enabled": self.active_config.enabled,
         }

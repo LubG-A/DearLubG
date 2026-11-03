@@ -9,7 +9,7 @@
 
 场景差异由子类补充：
 - GroupContext：评分、归因、direct 状态、主动触发调度器
-- PrivateContext：对方 QQ / 昵称（无评分/归因/主动触发）
+- PrivateContext：对方 QQ / 昵称 + 主动触发调度器（无评分/归因）
 """
 import threading
 from typing import Optional

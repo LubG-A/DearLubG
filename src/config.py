@@ -70,11 +70,12 @@ class MediaDownloadConfig:
 class PrivateConfig:
     """私聊配置。
 
-    私聊是群聊的减法：只回应白名单用户的一对一消息，不做评分/归因/主动触发。
+    私聊是群聊的减法：不做评分/归因/direct 状态；可选主动触发（偶尔主动找对方）。
     """
     enabled: bool = True
     allow_list: list = field(default_factory=list)  # 允许私聊的 QQ 白名单
     cooldown_seconds: int = 3                        # 回复后的冷却（秒）
+    active_trigger: ActiveTriggerConfig = None      # 私聊主动触发（缺省关闭）
 
 
 @dataclass
@@ -127,10 +128,19 @@ def load_config(path: str = "config.yaml") -> Config:
     )
 
     private_raw = raw.get("private", {})
+    private_active_raw = private_raw.get("active_trigger", {})
+    private_active = ActiveTriggerConfig(
+        enabled=private_active_raw.get("enabled", False),
+        min_interval_minutes=private_active_raw.get("min_interval_minutes", 120),
+        max_interval_minutes=private_active_raw.get("max_interval_minutes", 360),
+        night_start_hour=private_active_raw.get("night_start_hour", 23),
+        night_end_hour=private_active_raw.get("night_end_hour", 3),
+    )
     private = PrivateConfig(
         enabled=private_raw.get("enabled", True),
         allow_list=[str(q) for q in private_raw.get("allow_list", [])],
         cooldown_seconds=private_raw.get("cooldown_seconds", 3),
+        active_trigger=private_active,
     )
 
     vision_raw = raw.get("vision", {})

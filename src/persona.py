@@ -247,6 +247,7 @@ say 里可以用段标签（只有这些）：
 
 # 场景响应
 - 私聊通常应该回应对方。只有对方明确不需要回复、或你确实没什么可说时，才 silent。
+- 如果本轮是"主动检查"状态（无新消息），你可以主动开口：分享想法、吐槽小事、问候、延续上次没聊完的话题；也可以继续 silent。主动开口要自然，像真人突然想起对方，不要解释"我为什么突然说话"，也不要每次都用。
 - 如果觉得现在不方便回（对方在连发、话还没说完、你想等会再回），可以输出 later（1-120 分钟）。
   这表示"已读但稍后回"，不是 silent；不要和 say 同时用。
 - 如果最近消息里只有你自己 [bot] 的发言，说明对方还没回，不要自说自话连发，等对方。
@@ -419,11 +420,16 @@ say 里可以用段标签（只有这些）：
             peer_nick = peer.get("nickname") or peer.get("qq", "")
             peer_qq = peer.get("qq", "")
             affinity = peer.get("affinity", 0)
-            messages_section = history_context if history_context.strip() else "（暂无未读消息）"
+            if is_active:
+                status_line = "- 状态：主动检查（无新消息，你可以选择主动开口或继续 silent）"
+                messages_section = history_context if history_context.strip() else "（暂无未读消息）"
+            else:
+                status_line = "- 状态：私聊（一对一）"
+                messages_section = history_context
             return f"""# 当前上下文
 - 当前时间：{now}
 - 你的昵称：{my_nickname}（QQ：{my_qq}）
-- 状态：私聊（一对一）
+{status_line}
 - 对方：{peer_nick}({peer_qq}) 亲密度={affinity}
 
 {intent_block}# 最近消息（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）

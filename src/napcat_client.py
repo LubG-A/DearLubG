@@ -88,6 +88,10 @@ class NapCatClient:
     def get_group_member_list(self, group_id: str) -> list:
         return self._call("get_group_member_list", {"group_id": group_id}).get("data", [])
 
+    def get_friend_list(self) -> list:
+        """获取好友列表（/get_friend_list），用于私聊主动触发时补昵称。失败返回空列表。"""
+        return self._call("get_friend_list", {}, quiet=True, timeout=5).get("data", [])
+
     def get_group_member_info(self, group_id: str, user_id: str) -> dict:
         return self._call("get_group_member_info", {
             "group_id": group_id,

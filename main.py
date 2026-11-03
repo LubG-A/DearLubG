@@ -65,6 +65,7 @@ DIRECT_REPLY_COUNTDOWN_SECONDS = 9  # P003 v2.4：direct 回复倒计时，targe
 DIRECT_COUNTDOWN_MAX_RESETS = 9      # P003 v2.4：倒计时最多被 target 新发言重置的次数
 INTERRUPT_STREAK_LIMIT = 5           # P005：连续完整打断 N 次后，下一次忽略打断强制发出
 QUOTED_MESSAGE_MAX_CHARS = 500  # 引用消息原文最大字符数，避免上下文膨胀
+PRIVATE_ACTIVE_IDLE_MINUTES = 30   # 私聊主动触发：最近互动 < N 分钟时跳过，避免打断正在聊的天
 
 
 class Bot:
@@ -74,7 +75,7 @@ class Bot:
         self.config = load_config(config_path)
 
         # 全局共享单例（napcat / llm / affinity / persona / senders）
-        # 阶段 D：active_scheduler 移入 GroupContext（per-group 独立倒计时）
+        # 阶段 D/N：active_scheduler 在 GroupContext / PrivateContext（per-chat 独立倒计时）
         self.napcat = NapCatClient(self.config.napcat.base_url, self.config.napcat.group_ids)
         self.llm = LLMClient(self.config)
         self.affinity = AffinityManager()  # 全局按 QQ（跨群身份一致）
@@ -151,6 +152,30 @@ class Bot:
                 logger.info(f"私聊已启用，白名单 {len(allow)} 人：{allow}")
             else:
                 logger.warning("私聊已启用但 allow_list 为空，所有私聊消息都会被忽略")
+
+            # 私聊主动触发：为白名单用户预建上下文并启动 per-user 调度器。
+            # 预建可让重启后仍按持久化的 next_active_check_time 继续主动触发；
+            # 未在白名单的用户不会创建。先用好友列表补昵称，避免主动消息里显示 QQ 号。
+            if self._private_active_trigger_enabled():
+                friend_names = {}
+                try:
+                    for f in self.napcat.get_friend_list():
+                        fqq = str(f.get("user_id", ""))
+                        if fqq:
+                            friend_names[fqq] = f.get("remark") or f.get("nickname") or fqq
+                except Exception as e:
+                    logger.warning(f"获取好友列表失败（私聊主动触发昵称回退 QQ）: {e}")
+
+                for qq in sorted({str(q) for q in allow}):
+                    if qq == self.self_qq:
+                        continue
+                    self._get_or_create_private_ctx(qq, friend_names.get(qq, qq))
+                pa = self.config.private.active_trigger
+                logger.info(f"私聊主动触发调度器已启动：{len(self.private_chats)} 个对象，"
+                            f"间隔 {pa.min_interval_minutes}-{pa.max_interval_minutes} 分钟随机，"
+                            f"深夜 {pa.night_start_hour}:00-{pa.night_end_hour}:00 禁用")
+            else:
+                logger.info("私聊主动触发调度器已禁用")
         else:
             logger.info("私聊已禁用")
 
@@ -268,9 +293,22 @@ class Bot:
                 ctx = PrivateContext(user_qq, nickname or user_qq, self.config, self.llm)
                 self.private_chats[user_qq] = ctx
                 logger.info(f"创建私聊上下文：{ctx.peer_nickname}({user_qq})，状态目录 state/private/{user_qq}/")
+                if self._private_active_trigger_enabled():
+                    try:
+                        ctx.active_scheduler.start(self.on_private_active_trigger, user_qq)
+                        logger.info(f"私聊 {user_qq} 主动触发调度器已启动")
+                    except Exception as e:
+                        # 调度器启动失败不阻塞私聊消息处理
+                        logger.error(f"私聊 {user_qq} 主动触发调度器启动失败: {e}", exc_info=True)
             elif nickname and nickname != user_qq and nickname != ctx.peer_nickname:
                 ctx.peer_nickname = nickname
             return ctx
+
+    def _private_active_trigger_enabled(self) -> bool:
+        """私聊主动触发是否启用。"""
+        private_cfg = getattr(self.config, "private", None)
+        active_cfg = getattr(private_cfg, "active_trigger", None) if private_cfg else None
+        return bool(private_cfg and private_cfg.enabled and active_cfg and active_cfg.enabled)
 
     def on_private_message(self, msg: dict):
         """处理收到的私聊消息（接收线程）。
@@ -302,6 +340,7 @@ class Bot:
                 ctx._backlog_pending = True
                 ctx._send_interrupt.set()
                 ctx._interrupt_sender = sender_nick
+                logger.debug(f"{ctx.chat_key} 输出期间收到新消息，置位打断信号")
 
             # 语音转写：异步延迟重试，成功后回填历史 content
             if has_voice and msg_id:
@@ -394,6 +433,7 @@ class Bot:
                 if deadline is not None and deadline > time.time():
                     ctx._send_interrupt.set()
                     ctx._interrupt_sender = sender_nick
+                    logger.debug(f"{ctx.chat_key} 输出期间收到新消息，置位打断信号")
 
             # 语音转写：异步延迟重试，成功后回填历史 content
             if has_voice and msg_id:
@@ -869,6 +909,39 @@ class Bot:
         except Exception as e:
             logger.error(f"群 {group_id} 主动触发异常: {e}", exc_info=True)
 
+    def on_private_active_trigger(self, peer_qq: str):
+        """私聊主动触发回调（由 per-user 调度器调用）。
+
+        与群聊主动触发一致：无 pending 时让 LLM 自主决定是否主动开口。
+        额外加一层"不打断正在聊的天"保护：本 chat cycle 在跑、有未看消息、
+        或最近 30 分钟内有互动时跳过本次；调度器会自动安排下一次。
+        """
+        try:
+            ctx = self.private_chats.get(peer_qq)
+            if ctx is None:
+                logger.warning(f"私聊主动触发但未找到 {peer_qq} 的上下文")
+                return
+
+            if ctx._cycle_active or ctx.history.has_unseen_buffered_messages():
+                logger.info(f"私聊 {peer_qq} 主动触发但会话活跃/有未读消息，跳过本次")
+                return
+            if time.time() - ctx.last_reply_time < PRIVATE_ACTIVE_IDLE_MINUTES * 60:
+                logger.info(f"私聊 {peer_qq} 最近有互动，跳过本次主动触发")
+                return
+
+            logger.info(f"私聊 {peer_qq} 主动触发：执行 LLM 调用")
+            if not self._try_enter_cycle(ctx):
+                logger.debug(f"私聊 {peer_qq} 主动触发但 cycle 在跑，已入队等待")
+                return
+
+            try:
+                self._run_llm_cycle(ctx, soft_factors=None, is_active=True)
+            finally:
+                self._exit_cycle(ctx)
+                self._drain_cycle_queue()
+        except Exception as e:
+            logger.error(f"私聊 {peer_qq} 主动触发异常: {e}", exc_info=True)
+
     def _run_llm_cycle(self, ctx: ChatContext, soft_factors, is_active: bool):
         """LLM 工作循环（B2 方案：调用方已通过 _try_enter_cycle 获取运行权）。
 
@@ -886,16 +959,16 @@ class Bot:
         pending/messages/affinity/attribution 只在本线程访问，无竞争。
         """
         while True:
+            # 先清掉上一轮遗留的标记，再 drain：
+            # 若 drain 期间有新消息到达，接收线程会重新置位，不会在这里被误清掉。
+            ctx._backlog_pending = False
+            ctx._send_interrupt.clear()
+            ctx._interrupt_sender = ""
+
             # 1. drain fast_buffer
             drained = ctx.history.drain_buffer_to_pending()
             if drained > 0:
                 logger.debug(f"drain {drained} 条消息到 pending")
-            # drain 之后仍留在 fast_buffer 的才是"本轮输出期间到达、LLM 没看过"的欠账；
-            # 先清掉旧标记，之后到达的消息会由接收线程重新置位
-            ctx._backlog_pending = False
-            # 同一位置清空打断信号：本轮 LLM 调用/发送期间新到达的消息会重新置位
-            ctx._send_interrupt.clear()
-            ctx._interrupt_sender = ""
 
             # 2. 延迟回复到期
             due_count = ctx.history.pop_due_delayed_into_pending()
@@ -946,9 +1019,9 @@ class Bot:
 
             # 延迟回复处理：LLM 觉得"等会再回"，把这批消息存到 delayed_replies
             if parsed.reply_delay_minutes > 0 and parsed.action == "silent":
-                ctx.history.stash_pending_as_delayed(parsed.reply_delay_minutes)
-                # 私聊没有主动触发兜底，需要自己排程到期唤醒
-                if ctx.chat_type == "private":
+                stashed = ctx.history.stash_pending_as_delayed(parsed.reply_delay_minutes)
+                # 私聊没有主动触发兜底，需要自己排程到期唤醒；主动触发时 pending 为空则不排程
+                if ctx.chat_type == "private" and stashed > 0:
                     self._schedule_private_delayed_trigger(ctx, parsed.reply_delay_minutes)
                 if self._consume_pending_trigger(ctx):
                     continue
