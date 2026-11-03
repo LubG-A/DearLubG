@@ -4,7 +4,7 @@
 本脚本调用 LLM 把故事总结成对群聊表现有指导价值的要点，
 写入 state/background_summary.json（含 source_mtime 用于失效检测）。
 
-persona 渲染时读取 background_summary.json，插入到系统提示词的"# 你的过往"节。
+persona 渲染时读取 background_summary.json，插入到系统提示词的"## 你的过往经历"节。
 
 用法：
     python -m src.background_compiler           # 总结（mtime 变化才调用 LLM）
