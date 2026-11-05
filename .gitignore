@@ -1,0 +1,12 @@
+# 忽略手册
+OpenAPI.md
+
+# 忽略日志文件
+*.log
+
+# 忽略运行时产生的数据
+media/
+state/
+
+# 忽略pycache
+__pycache__/
