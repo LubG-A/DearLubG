@@ -8,7 +8,7 @@ napcat:
 llm:
   api_url: "https://api.deepseek.com/chat/completions"
   api_key: "sk-yuanshen666yuanshenqidong"
-  model: "deepseek-v4-flash"
+  model: "deepseek-flash"
 
 # 测试用 Persona 卡（开发阶段验证框架，非最终人格）
 # 部署阶段会替换为真实 Persona
@@ -42,11 +42,24 @@ media_download:
 trigger:
   peek_threshold: 10
   silent_buffer_limit: 30
-  history_limit: 240                  # 总轮数达 240 时触发分层压缩
-  history_keep_recent: 60             # 保留近 60 轮原文
-  history_keep_mid: 80                # 中期 80 轮做 LLM 摘要（60-140 轮之间）
+  history_limit: 240                  # 总轮数达 240（120 轮）时触发记忆整理，整理成功后才裁剪原文
+  history_keep_recent: 60             # 整理后保留近 60 轮原文
   attribution_step: 0.05
   cold_start_rounds: 20               # 冷启动保护：前 N 轮不更新 dynamic_weight，仅记日志
+
+# 记忆系统（长期记忆 + 近期日记 + 短期备忘）
+memory:
+  enabled: true
+  recent_journal_hours: 48            # 注入 user content 的近期日记时间窗（小时）
+  recent_journal_max_entries: 20      # 注入 user content 的近期日记最大条数
+  journal_entry_max_chars: 120        # 单条日记最大字数
+  journal_keep_hours: 72              # 整理后保留日记的时间窗（小时）
+  journal_keep_max_entries: 60        # 整理后保留日记的最大条数
+  core_max_chars: 1200                # 长期记忆最大字数
+  consolidate_times: ["12:00", "00:00"]  # 每日记忆整理时刻（本地时间）
+  memo_enabled: true                  # 短期备忘开关
+  memo_default_ttl_hours: 72          # 备忘默认过期时间（小时）
+  memo_max_items: 10                  # 备忘最大条数
 
 # 评分软因子 base_value（参与归因）
 trigger_factors:
@@ -69,4 +82,30 @@ active_trigger:
   max_interval_minutes: 420        # 主动触发最大间隔（分钟）
   night_start_hour: 23             # 深夜起始小时（此区间内禁用主动触发）
   night_end_hour: 3                # 深夜结束小时
+
+# 私聊配置（群聊的减法：白名单一对一，无评分/归因；可选主动触发）
+private:
+  enabled: true
+  allow_list: ["3184546563"]                 # 允许私聊的 QQ 白名单，部署时填写
+  cooldown_seconds: 3            # 回复后的冷却（秒），冷却内到达的消息走补触发
+  # 私聊主动触发：偶尔主动找白名单用户聊天（每个对象独立倒计时）
+  active_trigger:
+    enabled: true
+    min_interval_minutes: 120    # 主动触发最小间隔（分钟）
+    max_interval_minutes: 360    # 主动触发最大间隔（分钟）
+    night_start_hour: 23         # 深夜起始小时（禁用主动触发）
+    night_end_hour: 3            # 深夜结束小时
+
+# 识图配置（DeepSeek 多模态图片输入）
+vision:
+  enabled: true
+  max_images_per_turn: 6         # 单轮最多送几张图（控 token/请求体成本）
+  max_side: 1280                 # 图片最长边，超过则等比缩小（DeepSeek 会自动缩到约 1300）
+  detail: auto                   # low / high / original / auto
+
+# 对话前缀续写（DeepSeek Beta）：用户在消息结尾追加 `/pf 开头内容`
+prefix:
+  enabled: true
+  command: "/pf"
+  beta_api_url: "https://api.deepseek.com/beta/chat/completions"
 

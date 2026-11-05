@@ -1,8 +1,8 @@
 """多媒体素材库加载器。
 
 启动时一次性加载 media/manifest.json，渲染为 system prompt 片段（# 你的素材库 节）。
-作为稳定能力注入 system prompt 的稳定部分（summary 之前），
-不破坏前缀缓存——仅在 manifest 变更时断缓存一次，与 summary 压缩行为一致。
+作为稳定能力注入 system prompt 的稳定部分（长期记忆之后），
+不破坏前缀缓存——仅在 manifest 变更时断缓存一次，与记忆整理行为一致。
 
 manifest.json 由人工维护，结构见 media/manifest.json。
 """

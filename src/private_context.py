@@ -10,7 +10,6 @@ from typing import Optional
 
 from .chat_context import ChatContext
 from .config import ActiveTriggerConfig, Config
-from .llm_client import LLMClient
 from .scheduler import ActiveScheduler
 
 
@@ -18,11 +17,10 @@ class PrivateContext(ChatContext):
     """单个私聊对象的上下文容器。"""
 
     def __init__(self, peer_qq: str, peer_nickname: str, config: Config,
-                 llm: LLMClient, state_dir: str = "state"):
+                 state_dir: str = "state"):
         peer_qq = str(peer_qq)
         per_private_state_dir = f"{state_dir}/private/{peer_qq}"
-        super().__init__("private", peer_qq, config, llm,
-                         state_dir=per_private_state_dir)
+        super().__init__("private", peer_qq, config, state_dir=per_private_state_dir)
         self.peer_qq = peer_qq
         self.peer_nickname = peer_nickname or peer_qq
         # 延迟回复（later）到期唤醒定时器

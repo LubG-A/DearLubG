@@ -210,3 +210,90 @@ class ActiveScheduler:
             "next_active_check_time": self.next_active_check_time.isoformat() if self.next_active_check_time else None,
             "enabled": self.active_config.enabled,
         }
+
+
+def _parse_times(times: list) -> list[tuple[int, int]]:
+    """解析 ["12:00", "0:30"] 为 [(h, m), ...]，非法项忽略。"""
+    if isinstance(times, str):
+        times = [times]
+    parsed = []
+    for item in times or []:
+        text = str(item).strip()
+        if not text or ":" not in text:
+            logger.warning(f"忽略非法记忆整理时刻: {item}")
+            continue
+        hour_s, _, minute_s = text.partition(":")
+        try:
+            hour, minute = int(hour_s), int(minute_s)
+        except ValueError:
+            logger.warning(f"忽略非法记忆整理时刻: {item}")
+            continue
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            logger.warning(f"忽略越界记忆整理时刻: {item}")
+            continue
+        parsed.append((hour, minute))
+    return sorted(set(parsed))
+
+
+class FixedTimeScheduler:
+    """每天固定时刻触发的轻量调度器（记忆整理用）。
+
+    与 ActiveScheduler 的区别：
+    - 按固定时刻（如 12:00 / 00:00）触发，不做随机间隔与深夜跳过；
+    - 不持久化状态，重启后从当前时间重新计算下一个时刻；
+    - 回调无参数，调度器实例本身属于某个 chat。
+    """
+
+    def __init__(self, times: list, callback: Callable[[], None], label: str = ""):
+        self.times = _parse_times(times)
+        self._callback = callback
+        self.label = label
+        self._timer: Optional[threading.Timer] = None
+        self._stop_event = threading.Event()
+
+    def _next_time(self) -> datetime:
+        now = datetime.now()
+        for hour, minute in self.times:
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate > now:
+                return candidate
+        first_hour, first_minute = self.times[0]
+        tomorrow = now + timedelta(days=1)
+        return tomorrow.replace(hour=first_hour, minute=first_minute, second=0, microsecond=0)
+
+    def _schedule_next(self):
+        if self._stop_event.is_set() or not self.times:
+            return
+        next_time = self._next_time()
+        wait_seconds = max(5.0, (next_time - datetime.now()).total_seconds())
+        logger.info(f"{self.label} 下次记忆整理：{next_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"（{wait_seconds/60:.1f} 分钟后）")
+        if self._timer:
+            self._timer.cancel()
+        self._timer = threading.Timer(wait_seconds, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self):
+        if self._stop_event.is_set():
+            return
+        logger.info(f"{self.label} 记忆整理定时器到期")
+        try:
+            self._callback()
+        except Exception as e:
+            logger.error(f"{self.label} 记忆整理回调异常: {e}", exc_info=True)
+        finally:
+            self._schedule_next()
+
+    def start(self):
+        if not self.times:
+            logger.info(f"{self.label} 未配置有效时刻，记忆整理调度器不启动")
+            return
+        self._stop_event.clear()
+        self._schedule_next()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None

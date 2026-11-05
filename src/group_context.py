@@ -19,7 +19,6 @@ from .attribution import AttributionManager
 from .trigger import TriggerEvaluator
 from .affinity import AffinityManager
 from .napcat_client import NapCatClient
-from .llm_client import LLMClient
 from .scheduler import ActiveScheduler
 
 
@@ -34,20 +33,18 @@ class GroupContext(ChatContext):
         group_id: str,
         config: Config,
         napcat: NapCatClient,
-        llm: LLMClient,
         affinity: AffinityManager,
         self_qq: str,
         persona_name: str,
         state_dir: str = "state",
     ):
         per_group_state_dir = f"{state_dir}/{group_id}"
-        super().__init__("group", group_id, config, llm, state_dir=per_group_state_dir)
+        super().__init__("group", group_id, config, state_dir=per_group_state_dir)
 
         self.group_id = group_id
 
         # 共享单例引用（不拷贝）
         self.napcat = napcat
-        self.llm = llm
         self.affinity = affinity
 
         # per-group 状态管理器（子目录隔离：state/{group_id}/）

@@ -1,7 +1,8 @@
 """聊天上下文基类（群聊 / 私聊共用）。
 
 只保留场景无关的运行时状态：
-- history（messages / summary / pending / fast_buffer / delayed_replies）
+- history（messages / pending / fast_buffer / delayed_replies）
+- memory（长期记忆 core / 近期日记 journal / 短期备忘 memo）
 - last_reply_time（冷却计时）
 - 触发定时器（群聊静默窗口；私聊不使用）
 - _cycle_pending（撞 cycle 重试标志）
@@ -16,20 +17,20 @@ from typing import Optional
 
 from .config import Config
 from .history import HistoryManager
-from .llm_client import LLMClient
+from .memory import MemoryManager
 
 
 class ChatContext:
     """聊天上下文数据容器基类。"""
 
-    def __init__(self, chat_type: str, chat_id: str, config: Config,
-                 llm: LLMClient, state_dir: str):
+    def __init__(self, chat_type: str, chat_id: str, config: Config, state_dir: str):
         self.chat_type = chat_type          # "group" / "private"
         self.chat_id = str(chat_id)         # group_id / 对方 QQ
         self.config = config
 
         self.history = HistoryManager(config.trigger, state_dir=state_dir)
-        self.history.set_summarizer(llm.summarize)
+        # 记忆系统：长期记忆 / 近期日记 / 短期备忘（per-chat，独立于 messages）
+        self.memory = MemoryManager(config, state_dir=state_dir)
 
         # 冷却计时：最近一次实际发出回复的时间
         self.last_reply_time: float = 0.0

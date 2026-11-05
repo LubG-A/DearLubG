@@ -12,10 +12,16 @@ from .utils.logger import get_logger
 
 logger = get_logger("parser")
 
-COMMANDS = ("state", "note", "cues", "drivers", "inhibitors",
+COMMANDS = ("state", "note", "cues", "drivers", "inhibitors", "journal", "core", "memo", "forget",
             "conversation", "targets", "delay", "later", "affinity", "react", "say", "forward")
 # 可续行的自由文本指令
 FREE_TEXT_CMDS = ("note", "cues", "drivers", "inhibitors")
+# 内部记忆指令：只写记忆，不发送到聊天；落历史时会被剥离，避免历史里堆内部指令
+INTERNAL_COMMANDS = ("journal", "core", "memo", "forget")
+# 单条指令的保守上限（真实上限由 MemoryManager 按配置截断，这里防止异常超长载荷）
+JOURNAL_PAYLOAD_MAX = 2000
+CORE_PAYLOAD_MAX = 4000
+MEMO_PAYLOAD_MAX = 1000
 # 阶段 G：结构化内心状态的固定维度（全部 clip 到 [0,1]）
 STATE_DIMS = ("interest", "annoyance", "urge_to_speak", "social_risk", "energy", "banter")
 VALID_STATE_MODES = {"旁观", "接话", "吐槽", "补刀", "起哄", "主动开口"}
@@ -35,6 +41,11 @@ class ParsedResult:
     affinity_delta: dict = field(default_factory=dict)
     reply_delay_minutes: int = 0  # 延迟回复：N 分钟后再回这批消息
     conversation_mode: str = "open"  # 阶段 F：direct=与某人往返对话 / open=开放插话
+    # 记忆系统：内部指令，不发送到聊天
+    journal: list = field(default_factory=list)      # 新增日记条目
+    core_update: str = ""                             # 记忆整理时的长期记忆全量替换
+    memos: list = field(default_factory=list)         # 新增短期备忘
+    forget_ids: list = field(default_factory=list)    # 删除的备忘编号
 
 
 def parse_and_validate(raw_content: str) -> ParsedResult:
@@ -112,6 +123,21 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
             result.state.setdefault("dims", {d: 0.5 for d in STATE_DIMS})
             limit = 120 if cmd == "cues" else 60
             result.state[cmd] = payload[:limit]
+        elif cmd == "journal":
+            text = payload.strip()
+            if text and len(result.journal) < 3:
+                result.journal.append(text[:JOURNAL_PAYLOAD_MAX])
+        elif cmd == "core":
+            text = payload.strip()
+            if text:
+                result.core_update = text[:CORE_PAYLOAD_MAX]
+        elif cmd == "memo":
+            text = payload.strip()
+            if text and len(result.memos) < 3:
+                result.memos.append(text[:MEMO_PAYLOAD_MAX])
+        elif cmd == "forget":
+            # 只删除备忘；日记由代码按时间窗自动淘汰
+            result.forget_ids = [int(x) for x in re.findall(r"\d+", payload)][:20]
         elif cmd == "conversation":
             result.conversation_mode = payload if payload in ("direct", "open") else "open"
         elif cmd == "targets":
@@ -279,3 +305,19 @@ def _build_segment(name: str, val: str):
     if name == "voice_url":
         return ("ok", {"type": "voice", "data": {"channel": "url", "url": val}}) if val else ("drop", None)
     return ("literal", None)
+
+
+_INTERNAL_LINE_RE = re.compile(r"^\s*(journal|core|memo|forget)(\s*[:：]|\s+)", re.IGNORECASE)
+
+
+def strip_internal_commands(raw_content: str) -> str:
+    """剥离 assistant 输出中的内部记忆指令（落历史前调用）。
+
+    记忆由专门的 core/journal/memo 块呈现；如果把这些指令原样留进历史，
+    既会重复占用 token，也会让模型看到一串陈旧的备忘。
+    state/note/cues/drivers/inhibitors 等内心状态仍然保留，用于人格连续性。
+    """
+    if not isinstance(raw_content, str):
+        return ""
+    lines = [line for line in raw_content.splitlines() if not _INTERNAL_LINE_RE.match(line)]
+    return "\n".join(lines).strip()

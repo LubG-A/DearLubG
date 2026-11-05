@@ -41,11 +41,31 @@ class VoiceConfig:
 class TriggerConfig:
     peek_threshold: int
     silent_buffer_limit: int
-    history_limit: int
-    history_keep_recent: int
-    history_keep_mid: int = 0   # 中期摘要轮数（方案A分层压缩，0=禁用分层走旧逻辑）
+    history_limit: int          # 总轮数达 history_limit/2 时触发记忆整理，整理成功后才裁剪原文
+    history_keep_recent: int    # 整理后保留的近期原文轮数
     attribution_step: float = 0.1
     cold_start_rounds: int = 20
+
+
+@dataclass
+class MemoryConfig:
+    """记忆系统配置（长期记忆 + 近期日记 + 短期备忘）。
+
+    - enabled=False 时完全关闭记忆功能（不写文件、不注入 prompt、不调度整理）。
+    - 长期记忆（core）放 system prompt，仅在记忆整理时变化；
+      近期日记（journal）与备忘（memo）放 user content，避免破坏前缀缓存。
+    """
+    enabled: bool = True
+    recent_journal_hours: int = 48          # 注入 user content 的近期日记时间窗
+    recent_journal_max_entries: int = 20    # 注入 user content 的近期日记最大条数
+    journal_entry_max_chars: int = 120      # 单条日记最大字数
+    journal_keep_hours: int = 72            # 整理后保留日记的时间窗
+    journal_keep_max_entries: int = 60      # 整理后保留日记的最大条数
+    core_max_chars: int = 1200              # 长期记忆最大字数
+    consolidate_times: list = field(default_factory=lambda: ["12:00", "00:00"])  # 每日记忆整理时刻
+    memo_enabled: bool = True               # 短期备忘开关
+    memo_default_ttl_hours: int = 72        # 备忘默认过期时间（小时）
+    memo_max_items: int = 10                # 备忘最大条数
 
 
 @dataclass
@@ -117,6 +137,7 @@ class Config:
     private: PrivateConfig = None                # 私聊配置
     vision: VisionConfig = None                  # 识图配置
     prefix: PrefixConfig = None                  # 对话前缀续写配置
+    memory: MemoryConfig = None                  # 记忆系统配置
 
 
 def load_config(path: str = "config.yaml") -> Config:
@@ -174,6 +195,21 @@ def load_config(path: str = "config.yaml") -> Config:
         beta_api_url=prefix_raw.get("beta_api_url", "https://api.deepseek.com/beta/chat/completions"),
     )
 
+    memory_raw = raw.get("memory", {})
+    memory = MemoryConfig(
+        enabled=memory_raw.get("enabled", True),
+        recent_journal_hours=memory_raw.get("recent_journal_hours", 48),
+        recent_journal_max_entries=memory_raw.get("recent_journal_max_entries", 20),
+        journal_entry_max_chars=memory_raw.get("journal_entry_max_chars", 120),
+        journal_keep_hours=memory_raw.get("journal_keep_hours", 72),
+        journal_keep_max_entries=memory_raw.get("journal_keep_max_entries", 60),
+        core_max_chars=memory_raw.get("core_max_chars", 1200),
+        consolidate_times=memory_raw.get("consolidate_times", ["12:00", "00:00"]),
+        memo_enabled=memory_raw.get("memo_enabled", True),
+        memo_default_ttl_hours=memory_raw.get("memo_default_ttl_hours", 72),
+        memo_max_items=memory_raw.get("memo_max_items", 10),
+    )
+
     return Config(
         napcat=NapCatConfig(
             base_url=raw["napcat"]["base_url"],
@@ -190,4 +226,5 @@ def load_config(path: str = "config.yaml") -> Config:
         private=private,
         vision=vision,
         prefix=prefix,
+        memory=memory,
     )

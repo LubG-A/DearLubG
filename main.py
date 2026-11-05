@@ -42,7 +42,7 @@ from src.napcat_client import NapCatClient, NapCatWebhookServer
 from src.llm_client import LLMClient
 from src.affinity import AffinityManager
 from src.persona import PersonaRenderer
-from src.parser import parse_and_validate
+from src.parser import parse_and_validate, strip_internal_commands
 from src.prefix import build_assistant_prefix, extract_prefix_command
 from src.senders.message_sender import NapCatMessageSender
 from src.senders.voice_sender import AIRecordVoiceSender, LocalFileVoiceSender, UrlVoiceSender
@@ -52,6 +52,7 @@ from src.senders.emoji_reactor import EmojiReactor
 from src.group_context import GroupContext
 from src.private_context import PrivateContext
 from src.chat_context import ChatContext
+from src.scheduler import FixedTimeScheduler
 from src.utils.logger import get_logger
 
 logger = get_logger("main")
@@ -123,6 +124,8 @@ class Bot:
         self.private_chats: dict[str, PrivateContext] = {}
         # 私聊上下文懒创建锁：接收线程并发到达时避免同一 QQ 创建两个上下文
         self._private_ctx_lock = threading.Lock()
+        # 记忆整理调度器：{chat_key -> FixedTimeScheduler}（按每日固定时刻触发）
+        self.memory_schedulers: dict[str, FixedTimeScheduler] = {}
 
     def warmup(self):
         """启动预热。"""
@@ -136,12 +139,22 @@ class Bot:
                 group_id=group_id,
                 config=self.config,
                 napcat=self.napcat,
-                llm=self.llm,
                 affinity=self.affinity,
                 self_qq=self.self_qq,
                 persona_name=self.config.persona.name,
             )
             self.groups[group_id] = ctx
+            self._start_memory_scheduler(ctx)
+
+        if self._memory_enabled():
+            cfg = self.config.memory
+            logger.info(
+                f"记忆系统已启用：{len(self.memory_schedulers)} 个 chat 已启动整理调度，"
+                f"时刻 {cfg.consolidate_times}，日记保留 {cfg.recent_journal_hours}h/"
+                f"{cfg.recent_journal_max_entries} 条，备忘 TTL {cfg.memo_default_ttl_hours}h"
+            )
+        else:
+            logger.info("记忆系统已禁用")
 
         # 探测 AI 语音 character 是否可用（不阻塞启动）
         self._probe_ai_voice_character()
@@ -291,9 +304,11 @@ class Bot:
         with self._private_ctx_lock:
             ctx = self.private_chats.get(user_qq)
             if ctx is None:
-                ctx = PrivateContext(user_qq, nickname or user_qq, self.config, self.llm)
+                ctx = PrivateContext(user_qq, nickname or user_qq, self.config)
                 self.private_chats[user_qq] = ctx
                 logger.info(f"创建私聊上下文：{ctx.peer_nickname}({user_qq})，状态目录 state/private/{user_qq}/")
+                # 记忆整理调度器与主动触发无关，私聊开启记忆时都要启动
+                self._start_memory_scheduler(ctx)
                 if self._private_active_trigger_enabled():
                     try:
                         ctx.active_scheduler.start(self.on_private_active_trigger, user_qq)
@@ -310,6 +325,130 @@ class Bot:
         private_cfg = getattr(self.config, "private", None)
         active_cfg = getattr(private_cfg, "active_trigger", None) if private_cfg else None
         return bool(private_cfg and private_cfg.enabled and active_cfg and active_cfg.enabled)
+
+    # ---------- 记忆系统 ----------
+    def _memory_enabled(self) -> bool:
+        cfg = getattr(self.config, "memory", None)
+        return bool(cfg and cfg.enabled)
+
+    def _memory_memo_enabled(self) -> bool:
+        cfg = getattr(self.config, "memory", None)
+        return bool(cfg and cfg.enabled and cfg.memo_enabled)
+
+    def _start_memory_scheduler(self, ctx: ChatContext):
+        """为某个 chat 启动每日固定时刻的记忆整理调度器。"""
+        if not self._memory_enabled():
+            return
+        if ctx.chat_key in self.memory_schedulers:
+            return
+        times = getattr(self.config.memory, "consolidate_times", None) or []
+        if not times:
+            logger.info(f"{ctx.chat_key} 未配置记忆整理时刻，跳过调度")
+            return
+        scheduler = FixedTimeScheduler(
+            times,
+            lambda ctx=ctx: self.on_memory_consolidation(ctx),
+            label=f"记忆整理 {ctx.chat_key}",
+        )
+        self.memory_schedulers[ctx.chat_key] = scheduler
+        scheduler.start()
+
+    def _should_compact_memory(self, ctx: ChatContext) -> bool:
+        """历史轮数达到上限时，本轮要求模型先整理记忆。"""
+        if not self._memory_enabled():
+            return False
+        limit_turns = max(1, self.config.trigger.history_limit // 2)
+        return ctx.history.turn_count() >= limit_turns
+
+    def _has_memory_to_consolidate(self, ctx: ChatContext) -> bool:
+        """是否还有值得整理的历史/记忆。"""
+        return (
+            ctx.history.turn_count() > 0
+            or ctx.memory.has_journal()
+            or bool(ctx.memory.get_core())
+        )
+
+    def _apply_memory_updates(self, ctx: ChatContext, parsed, allow_core: bool) -> bool:
+        """把模型输出的 journal/core/memo 指令写入 MemoryManager。
+
+        Args:
+            allow_core: 只有记忆整理（阈值触发或定时整理）时才允许替换长期记忆，
+                        避免普通轮次频繁更新 core 导致 system prompt 缓存频繁失效。
+
+        Returns:
+            True 表示本轮产出了可用的记忆（core 或 journal），可用于决定是否裁剪原文。
+        """
+        if not self._memory_enabled():
+            return False
+
+        wrote_memory = False
+        # 日记先写入，再按 core 更新后的保留策略淘汰旧条目
+        for text in parsed.journal:
+            if ctx.memory.add_journal(text):
+                wrote_memory = True
+        if allow_core and parsed.core_update:
+            if ctx.memory.set_core(parsed.core_update):
+                logger.info(f"{ctx.chat_key} 长期记忆已更新（{len(parsed.core_update)} 字）")
+            ctx.memory.prune_journal()
+            wrote_memory = True
+
+        if self._memory_memo_enabled():
+            for text in parsed.memos:
+                ctx.memory.add_memo(text)
+            if parsed.forget_ids:
+                ctx.memory.remove_memos(parsed.forget_ids)
+
+        return wrote_memory
+
+    def on_memory_consolidation(self, ctx: ChatContext):
+        """定时记忆整理回调（每日固定时刻，由 FixedTimeScheduler 触发）。
+
+        整理 cycle 不回复聊天、不消费 pending；只读取 history 并更新 core/journal。
+        撞其他 chat 的 cycle 时跳过本次，避免把正常对话拖慢。
+        """
+        try:
+            if not self._memory_enabled():
+                return
+            if not self._has_memory_to_consolidate(ctx):
+                logger.info(f"{ctx.chat_key} 记忆整理跳过：没有可整理的历史")
+                return
+            if not self._try_enter_cycle(ctx, register_retry=False):
+                logger.info(f"{ctx.chat_key} 记忆整理撞 cycle，跳过本次")
+                return
+            try:
+                self._run_memory_cycle(ctx)
+            finally:
+                self._exit_cycle(ctx)
+                self._drain_cycle_queue()
+        except Exception as e:
+            logger.error(f"{ctx.chat_key} 记忆整理异常: {e}", exc_info=True)
+
+    def _run_memory_cycle(self, ctx: ChatContext):
+        """执行一次记忆整理（不发送聊天消息，不写 conversation turn）。"""
+        core = ctx.memory.get_core()
+        journal = ctx.memory.render_journal_for_consolidation()
+        memo = ctx.memory.render_memo_block()
+        system_prompt = self.persona_renderer.render_system_prompt(
+            core_memory=core, chat_type=ctx.chat_type
+        )
+        history_messages = ctx.history.get_messages_for_llm()
+        user_content = self.persona_renderer.render_memory_consolidation(
+            core, journal, memo
+        )
+        logger.info(f"{ctx.chat_key} 记忆整理开始（历史 {ctx.history.turn_count()} 轮）")
+        raw_result = self.llm.chat(system_prompt, history_messages, user_content)
+        if raw_result is None:
+            logger.warning(f"{ctx.chat_key} 记忆整理 LLM 调用失败，保留原文，下次再试")
+            return
+
+        parsed = parse_and_validate(raw_result)
+        wrote_memory = self._apply_memory_updates(ctx, parsed, allow_core=True)
+        if wrote_memory:
+            keep_turns = max(1, self.config.trigger.history_keep_recent // 2)
+            ctx.history.trim_to_recent(keep_turns)
+            logger.info(f"{ctx.chat_key} 记忆整理完成")
+        else:
+            logger.warning(f"{ctx.chat_key} 记忆整理未产出 core/journal，保留原文，下次再试")
 
     def _prefix_settings(self) -> tuple[bool, str]:
         """对话前缀续写开关与指令词。"""
@@ -704,7 +843,7 @@ class Bot:
             return True
         return False
 
-    def _try_enter_cycle(self, ctx: ChatContext) -> bool:
+    def _try_enter_cycle(self, ctx: ChatContext, register_retry: bool = True) -> bool:
         """尝试进入 LLM cycle（B2 方案）。
 
         用 _cycle_running 标志保证 cycle 串行，代替 _llm_lock 覆盖全流程。
@@ -712,15 +851,17 @@ class Bot:
 
         Args:
             ctx: 群上下文。撞 cycle 时把 _cycle_pending 标记到该 ctx（per-group）。
+            register_retry: False=撞 cycle 时不注册重试（记忆整理用，跳过本次即可）。
 
         Returns:
             True: 成功进入 cycle（调用方负责执行 _run_llm_cycle + _exit_cycle）
-            False: 已有 cycle 在跑，已注册 ctx._cycle_pending 重试（调用方直接返回）
+            False: 已有 cycle 在跑（register_retry=True 时已注册重试）
         """
         with self._cycle_lock:
             if self._cycle_running:
-                ctx._cycle_pending = True
-                self._enqueue_chat(ctx.chat_key)
+                if register_retry:
+                    ctx._cycle_pending = True
+                    self._enqueue_chat(ctx.chat_key)
                 return False
             self._cycle_running = True
             ctx._cycle_active = True
@@ -1029,15 +1170,36 @@ class Bot:
                 return
 
             # 4. 构建 user_content（创建快照供 reply/react 段引用）
-            summary = ctx.history.get_summary()
-            system_prompt = self.persona_renderer.render_system_prompt(summary, chat_type=ctx.chat_type)
+            #    长期记忆进 system；近期日记与备忘进 user content（缓存安全）
+            needs_compact = self._should_compact_memory(ctx)
+            core_memory = ctx.memory.get_core() if self._memory_enabled() else ""
+            system_prompt = self.persona_renderer.render_system_prompt(
+                core_memory=core_memory, chat_type=ctx.chat_type
+            )
             history_messages = ctx.history.get_messages_for_llm()
             member_list = self._build_member_list(ctx)
             pending_text = ctx.history.build_user_content()
-            new_user_content = self.persona_renderer.render_user_content(
-                pending_text, member_list, self.self_nickname, self.self_qq,
+            journal_block = ""
+            memo_block = ""
+            if self._memory_enabled():
+                # 记忆整理时给全部日记（否则只看近期窗口），确保 core 能吸收完整上下文
+                journal_block = (
+                    ctx.memory.render_journal_for_consolidation() if needs_compact
+                    else ctx.memory.render_journal_block()
+                )
+                memo_block = ctx.memory.render_memo_block()
+            render_kwargs = dict(
                 is_active=is_active, chat_type=ctx.chat_type, peer=self._private_peer(ctx),
                 interrupted_intent=self._format_unsent_intent(ctx),
+                journal=journal_block, memo=memo_block, memory_consolidation=needs_compact,
+            )
+            new_user_content = self.persona_renderer.render_user_content(
+                pending_text, member_list, self.self_nickname, self.self_qq, **render_kwargs
+            )
+            # 落历史版本：剥离备忘/日记/整理指令，避免旧提示冻结在 messages 里
+            stored_user_content = self.persona_renderer.render_user_content(
+                pending_text, member_list, self.self_nickname, self.self_qq,
+                **{**render_kwargs, "for_storage": True},
             )
 
             # 5. 调用 LLM（不持锁，_cycle_running 标志保证串行）
@@ -1060,11 +1222,18 @@ class Bot:
                     continue
                 return
 
-            # 6. 解析 + 落地
+            # 6. 解析 + 记忆 + 落地
             parsed = parse_and_validate(raw_result)
             logger.info(f"LLM 返回 action={parsed.action} state={_format_state(parsed.state)}"
                         f"{' reply_delay=' + str(parsed.reply_delay_minutes) + 'min' if parsed.reply_delay_minutes > 0 else ''}"
                         f"{' [主动触发]' if is_active else ''}")
+            if parsed.journal or parsed.memos or parsed.forget_ids or (needs_compact and parsed.core_update):
+                logger.info(f"{ctx.chat_key} 记忆更新：journal={len(parsed.journal)} "
+                            f"core={len(parsed.core_update) if needs_compact else 0} "
+                            f"memo={len(parsed.memos)} forget={parsed.forget_ids}")
+
+            # 记忆写入先于延迟回复分支：即使本轮 later，日记/备忘也应落盘
+            wrote_memory = self._apply_memory_updates(ctx, parsed, allow_core=needs_compact)
 
             # 延迟回复处理：LLM 觉得"等会再回"，把这批消息存到 delayed_replies
             if parsed.reply_delay_minutes > 0 and parsed.action == "silent":
@@ -1078,9 +1247,20 @@ class Bot:
 
             # 清空 pending（user_content 已在步骤 4 构建，不重新 build）
             ctx.history.consume_pending_into_user()
-            ctx.history.append_turn(new_user_content, raw_result)
+            # 内部记忆指令不写入历史（记忆由 core/journal/memo 块统一呈现）
+            stored_assistant = strip_internal_commands(raw_result) or raw_result
+            ctx.history.append_turn(stored_user_content, stored_assistant)
             # 未发出的计划已注入本轮 user content，消费完毕
             ctx._unsent_intent = None
+
+            # 记忆整理：只有本轮确实产出了 core/journal 才裁剪旧原文；
+            # 没产出就保留原文，下次 cycle 继续提示整理（消息不丢失）
+            if needs_compact:
+                if wrote_memory:
+                    keep_turns = max(1, self.config.trigger.history_keep_recent // 2)
+                    ctx.history.trim_to_recent(keep_turns)
+                else:
+                    logger.warning(f"{ctx.chat_key} 记忆整理未产出 core/journal，保留原文，下次再试")
 
             # 7. 发送 + 归因（不持锁，发送期间群消息和 bot 回复都进 fast_buffer）
             self._handle_result(ctx, parsed, soft_factors)

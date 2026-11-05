@@ -82,6 +82,15 @@ COMMON_SPECIAL_EVENTS = """# 特殊情况（撤回 / 戳一戳）
    - 不要每次都戳回去或说同样的话
    - 你也可以戳别人：在 say 里用 [poke:对方QQ]，熟人之间互戳、想引起注意时偶尔用，别滥用"""
 
+COMMON_MEMORY_RULES = """# 记忆（你自己的笔记）
+「# 你记得的事」是你自己之前记下的长期/近期记忆，不是当前聊天消息，用来保持连续性。不要向别人复述或解释这些记忆，除非当前话题自然需要。
+- 记日记：一段话题自然结束、或发生了值得记住的事（约定、冲突、重要情绪、谁说过什么）时，可以输出一行 `journal: 一句话`（不超过 120 字，写清谁/发生了什么）。不要每轮都记，也不要记流水账。
+- 记忆整理：如果当前 user content 出现「# 记忆整理」，按那里的要求输出 `core:`/`journal:`/`forget:`。定时整理不要回复聊天；普通轮次里的整理则先更新记忆，再正常决定是否回复。"""
+
+COMMON_MEMO_RULES = """「# 你的备忘录」是你给自己留的临时提醒（比如这群人让你少说话、某人最近心情不好），只影响你怎么回，不要念出来。
+- 需要提醒自己时输出 `memo: 一句话`；提醒不再成立时输出 `forget: 编号`。备忘会自动过期，不要依赖它永久有效。
+- 常见场景：群里说"你话太多了/少说点"，就记一条；有人说"今天别开玩笑"，也记一条；气氛变了或过几天再 forget。"""
+
 
 # ==================== 群聊场景片段 ====================
 
@@ -189,13 +198,28 @@ def _render_relationship_rules(chat_type: str) -> str:
     +1 对方有趣/有共鸣/主动搭话且态度友好；+2 对方让你很开心/帮了你/深聊过；-1 对方无聊/刷屏但不算恶劣；-2 对方冒犯/挑衅/让你生气。不输出就是不变。"""
 
 
-def _render_protocol(chat_type: str) -> str:
+def _render_protocol(chat_type: str, memory_enabled: bool = True, memo_enabled: bool = True) -> str:
     """输出协议：行指令 + 段标签 + 引用规则 + 群聊专属字段。"""
     is_group = chat_type == "group"
     group_commands = (
         "conversation: direct 或 open（本轮有 say 时输出）\n"
         "targets: 对方昵称或QQ，逗号分隔\n"
         if is_group
+        else ""
+    )
+    memory_lines = []
+    if memory_enabled:
+        memory_lines.append("journal: 记一句长期记忆（不超过 120 字，写清谁/发生了什么；不要每轮都写）")
+        memory_lines.append("core: 记忆整理时输出完整长期记忆（用；分隔要点）")
+    if memo_enabled:
+        memory_lines.append("memo: 给自己留的临时提醒（一句话）")
+        memory_lines.append("forget: 备忘编号，逗号分隔（只删备忘）")
+    memory_commands = "".join(line + "\n" for line in memory_lines)
+    memory_note = (
+        "## 记忆指令（内部）\n"
+        "- journal/core/memo/forget 只写进你自己的记忆，不会发送到聊天；不要把它们写进 say。\n"
+        "- forget 只删备忘录；日记由系统按时间自动淘汰。\n\n"
+        if memory_lines
         else ""
     )
     at_tag = "[at:QQ] " if is_group else ""
@@ -233,7 +257,7 @@ note: 一句话内心 OS（不超过 20 字），可以带空格和标点
 cues: 注意到的点（1-3 条，每条描述需要详细，用；分隔）
 drivers: 想开口的理由（0-2 条，每条描述需要详细）
 inhibitors: 不想开口的理由（0-2 条，每条描述需要详细）
-{group_commands}say: 一条消息。要发多条就写多行 say。内容原样写，不要转义；决定不发言就不要写 say。
+{memory_commands}{group_commands}say: 一条消息。要发多条就写多行 say。内容原样写，不要转义；决定不发言就不要写 say。
 delay: 0-15 秒
 later: 1-120 分钟（已读晚回；不要和 say 同时写）
 affinity: QQ,±1/±2
@@ -254,7 +278,7 @@ forward: 标题，后面每行用 "> 昵称: 内容"
 - 一条 say 尽量写在一行；写不下时换行会被拼回上一条 say。
 - 素材路径/URL 必须从「# 你的素材库」清单里精确复制，不可凭空编造；本地文件路径写错会发送失败跳过。
 
-## 引用回复（[reply:msg_id]）
+{memory_note}## 引用回复（[reply:msg_id]）
 - 消息列表每行行首带 [#msg_id] 标记（如 [#1281341473]），在 say 里用 [reply:msg_id] 引用：`say: [reply:1281341473]`。必须精确复制行首的 msg_id 数字，不可近似或省略。[bot] 开头的消息是你自己之前发的，无 [#msg_id] 标记，不可引用。
 {quote_scene}
 
@@ -277,6 +301,13 @@ class PersonaRenderer:
         # 启动时加载一次素材库清单（稳定能力，不每次 render 重读，避免破坏前缀缓存）
         self._media_library = MediaLibrary(media_manifest)
 
+        # 记忆系统开关与长度上限（从 config.memory 读取，缺失时用默认值）
+        memory_cfg = getattr(config, "memory", None)
+        self._memory_enabled = bool(memory_cfg and memory_cfg.enabled)
+        self._memo_enabled = bool(memory_cfg and memory_cfg.enabled and memory_cfg.memo_enabled)
+        self._memory_core_max = getattr(memory_cfg, "core_max_chars", 1200) if memory_cfg else 1200
+        self._memory_entry_max = getattr(memory_cfg, "journal_entry_max_chars", 120) if memory_cfg else 120
+
     def _render_persona_card(self) -> str:
         """渲染共用的身份卡（群聊 / 私聊共用）。"""
         p = self.config.persona
@@ -292,13 +323,25 @@ class PersonaRenderer:
 ## 你的过往经历
 {background}"""
 
-    def _ordered_blocks(self, chat_type: str) -> list[str]:
+    def _render_core_memory(self, core_memory: str) -> str:
+        """渲染长期记忆（放 system prompt，仅记忆整理时变化）。空则不渲染。"""
+        core_memory = (core_memory or "").strip()
+        if not core_memory:
+            return ""
+        core_memory = core_memory[:self._memory_core_max]
+        return f"""# 你的长期记忆
+这是你自己整理的长期记忆，可能不完整。只用来保持连续性和判断关系，不要向别人复述。
+{core_memory}"""
+
+    def _ordered_blocks(self, chat_type: str, core_memory: str = "") -> list[str]:
         """按固定顺序返回各节文本；增删节或调整顺序只改这里。
 
-        顺序：身份 → 任务 → 红线 → 语气 → 读懂 → 决定 → 状态 → 边角 → 素材 → 协议。
+        顺序：身份 → 任务 → 红线 → 语气 → 读懂 → 决定 → 状态 → 边角
+              → 记忆规则 → 长期记忆 → 素材 → 协议。
+        长期记忆只在记忆整理后才变化（低频），因此放在 system 中不会频繁断缓存。
         """
         is_group = chat_type == "group"
-        return [
+        blocks = [
             self._render_persona_card(),
             GROUP_TASK if is_group else PRIVATE_TASK,
             COMMON_HARD_CONSTRAINTS if is_group
@@ -308,50 +351,111 @@ class PersonaRenderer:
             GROUP_RESPONSE if is_group else PRIVATE_RESPONSE,
             COMMON_STATE,
             COMMON_SPECIAL_EVENTS,
-            self._media_library.render_for_prompt(),
-            _render_protocol(chat_type),
         ]
+        if self._memory_enabled:
+            memory_rules = COMMON_MEMORY_RULES
+            if self._memo_enabled:
+                memory_rules = memory_rules + "\n" + COMMON_MEMO_RULES
+            blocks.append(memory_rules)
+            blocks.append(self._render_core_memory(core_memory))
+        blocks.append(self._media_library.render_for_prompt())
+        blocks.append(_render_protocol(chat_type, self._memory_enabled, self._memo_enabled))
+        return blocks
 
-    def render_system_prompt(self, summary: str = "", chat_type: str = "group") -> str:
+    def render_system_prompt(self, core_memory: str = "", chat_type: str = "group") -> str:
         """渲染系统提示词。
 
         Args:
-            summary: 早期对话摘要（拼到末尾）
+            core_memory: 长期记忆（由 MemoryManager 提供，记忆整理后更新）
             chat_type: "group" 使用群聊场景片段；"private" 使用私聊场景片段
         """
         prompt = "\n\n".join(
-            block.strip() for block in self._ordered_blocks(chat_type) if block and block.strip()
+            block.strip() for block in self._ordered_blocks(chat_type, core_memory)
+            if block and block.strip()
         )
         # 身份卡里的名字占位
         prompt = prompt.replace("{name}", self.config.persona.name)
-        if summary:
-            prompt += (
-                "\n\n# 早期对话摘要（你之前看过的消息）\n"
-                "注：摘要内容不属于当前对话，而是早期历史对话总结。"
-                "除非与当前的主题存在自然关联，否则不应主动对摘要的内容进行处理。\n"
-                f"{summary}"
-            )
         return prompt
+
+    def render_memory_consolidation(self, core_memory: str, journal: str, memo: str) -> str:
+        """渲染记忆整理 cycle 的 user content（不需要回复聊天）。
+
+        与普通 user content 不同：不包含群消息，只给模型看现有记忆和整理要求。
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M %A")
+        memo_instruction = (
+            "  3. `forget: <要删除的备忘编号>`（可选，逗号分隔）。\n"
+            if self._memo_enabled else ""
+        )
+        memo_section = (
+            f"\n# 备忘录\n{memo.strip() or '（空）'}\n"
+            if self._memo_enabled else ""
+        )
+        return f"""# 记忆整理
+- 当前时间：{now}
+- 这是你自己的记忆整理时间，不需要回复聊天，也不要写 say/state。
+- 请输出以下内部指令：
+  1. `core: <完整的新长期记忆>`：用；分隔要点，不超过 {self._memory_core_max} 字。
+     保留：人物事实与关系、承诺/约定、未结话题、群里的规矩与梗、你对某些人的态度。
+     没有新内容时，原样输出现有长期记忆，不要清空。
+  2. `journal: <需要保留的新条目>`（可选，一行一条，不超过 {self._memory_entry_max} 字）。
+{memo_instruction}
+# 现有长期记忆
+{core_memory.strip() or "（空）"}
+
+# 近期日记
+{journal.strip() or "（空）"}
+{memo_section}
+请按行指令输出。"""
 
     def render_user_content(self, history_context: str, member_list: list, my_nickname: str, my_qq: str,
                             is_active: bool = False, chat_type: str = "group", peer: dict = None,
-                            interrupted_intent: str = "") -> str:
-        """渲染 user 消息内容（上下文 + 成员/对方 + 最近消息）。
+                            interrupted_intent: str = "",
+                            journal: str = "", memo: str = "",
+                            memory_consolidation: bool = False, for_storage: bool = False) -> str:
+        """渲染 user 消息内容（上下文 + 记忆 + 成员/对方 + 最近消息）。
 
         群聊与私聊只在「状态文案 / 成员或对方信息 / 消息标题」三处分叉，
-        其余结构（意图回填、消息主体、结尾指令）完全共用。
+        其余结构（记忆块、意图回填、消息主体、结尾指令）完全共用。
 
         Args:
             is_active: 是否为主动触发（无新消息，LLM 自主决定要不要主动开口）
             chat_type: "group" 渲染群成员列表；"private" 只渲染对方信息
             peer: 私聊对方信息 {qq, nickname, affinity}
             interrupted_intent: P005：上一轮被打断、未发出的计划说明（空则不渲染该节）
+            journal: 近期日记块（MemoryManager.render_journal_block）
+            memo: 短期备忘块（MemoryManager.render_memo_block）
+            memory_consolidation: 本轮是否要求模型更新长期记忆
+            for_storage: True=用于写入 conversation.json，省略记忆块与整理指令
+                         （避免历史里堆过期备忘/日记）
         """
         now = datetime.now().strftime("%Y-%m-%d %H:%M %A")
         intent_block = (
             f"# 被打断的发言\n{interrupted_intent.strip()}\n\n"
             if interrupted_intent.strip() else ""
         )
+
+        # 记忆块只进当前请求，不进历史；避免旧备忘/旧日记冻结在 messages 里
+        if for_storage:
+            memo_block = ""
+            journal_block = ""
+            consolidation_block = ""
+        else:
+            memo_block = (
+                f"# 你的备忘录（短期提醒，只给自己看，不要复述）\n{memo.strip()}\n\n"
+                if self._memo_enabled and memo.strip() else ""
+            )
+            journal_block = (
+                f"# 你记得的事（过去的记忆，不是当前消息，不要复述）\n{journal.strip()}\n\n"
+                if self._memory_enabled and journal.strip() else ""
+            )
+            consolidation_block = (
+                "# 记忆整理（本轮先更新记忆，再决定是否回复）\n"
+                f"当前历史已接近上限。请先输出 core: 完整的新长期记忆"
+                f"（用；分隔，不超过 {self._memory_core_max} 字），可同时输出 journal: 新条目。"
+                "系统会在你产出记忆后裁剪更早的原文；没有产出记忆则保留原文。\n\n"
+                if memory_consolidation else ""
+            )
 
         # 状态行：主动检查 / 被动触发（私聊是一对一）
         if is_active:
@@ -385,7 +489,7 @@ class PersonaRenderer:
 {status_line}
 {context_line}
 
-{intent_block}{message_title}（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
+{memo_block}{journal_block}{consolidation_block}{intent_block}{message_title}（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
 {messages_section}
 
 请按行指令输出。"""
