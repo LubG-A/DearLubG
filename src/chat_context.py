@@ -63,22 +63,6 @@ class ChatContext:
         self._unsent_intent: Optional[dict] = None
         self._interrupt_streak: int = 0
 
-        # 对话前缀续写（/pf）：接收线程写入，下一轮 LLM 调用前消费
-        self._assistant_prefix: str = ""
-        self._assistant_prefix_lock = threading.Lock()
-
-    def set_assistant_prefix(self, prefix: str):
-        """设置下一轮 LLM 调用的 assistant 前缀（/pf 指令）。"""
-        with self._assistant_prefix_lock:
-            self._assistant_prefix = prefix
-
-    def take_assistant_prefix(self) -> str:
-        """取出并清空 assistant 前缀；没有则返回空字符串。"""
-        with self._assistant_prefix_lock:
-            prefix = self._assistant_prefix
-            self._assistant_prefix = ""
-            return prefix
-
     @property
     def chat_key(self) -> str:
         """全局唯一 chat key，用于 cycle 队列。"""

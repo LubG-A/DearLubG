@@ -112,18 +112,6 @@ class VisionConfig:
 
 
 @dataclass
-class PrefixConfig:
-    """对话前缀续写配置（DeepSeek Beta）。
-
-    用户在消息末尾追加 `command 开头内容`，框架把解析后的行指令作为
-    assistant 前缀发给 Beta 接口，让模型从指定位置继续生成。
-    """
-    enabled: bool = False
-    command: str = "/pf"
-    beta_api_url: str = "https://api.deepseek.com/beta/chat/completions"
-
-
-@dataclass
 class Config:
     napcat: NapCatConfig
     llm: LLMConfig
@@ -136,7 +124,6 @@ class Config:
     media_download: MediaDownloadConfig = None  # 媒体下载配置
     private: PrivateConfig = None                # 私聊配置
     vision: VisionConfig = None                  # 识图配置
-    prefix: PrefixConfig = None                  # 对话前缀续写配置
     memory: MemoryConfig = None                  # 记忆系统配置
 
 
@@ -188,13 +175,6 @@ def load_config(path: str = "config.yaml") -> Config:
         detail=detail,
     )
 
-    prefix_raw = raw.get("prefix", {})
-    prefix = PrefixConfig(
-        enabled=prefix_raw.get("enabled", False),
-        command=prefix_raw.get("command", "/pf"),
-        beta_api_url=prefix_raw.get("beta_api_url", "https://api.deepseek.com/beta/chat/completions"),
-    )
-
     memory_raw = raw.get("memory", {})
     memory = MemoryConfig(
         enabled=memory_raw.get("enabled", True),
@@ -225,6 +205,5 @@ def load_config(path: str = "config.yaml") -> Config:
         media_download=media_download,
         private=private,
         vision=vision,
-        prefix=prefix,
         memory=memory,
     )

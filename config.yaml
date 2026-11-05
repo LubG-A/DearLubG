@@ -103,9 +103,3 @@ vision:
   max_side: 1280                 # 图片最长边，超过则等比缩小（DeepSeek 会自动缩到约 1300）
   detail: auto                   # low / high / original / auto
 
-# 对话前缀续写（DeepSeek Beta）：用户在消息结尾追加 `/pf 开头内容`
-prefix:
-  enabled: true
-  command: "/pf"
-  beta_api_url: "https://api.deepseek.com/beta/chat/completions"
-
