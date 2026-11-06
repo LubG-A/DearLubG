@@ -76,6 +76,13 @@ INTERRUPT_STREAK_LIMIT = 5           # P005：连续完整打断 N 次后，下�
 QUOTED_MESSAGE_MAX_CHARS = 500  # 引用消息原文最大字符数，避免上下文膨胀
 PRIVATE_ACTIVE_IDLE_MINUTES = 30   # 私聊主动触发：最近互动 < N 分钟时跳过，避免打断正在聊的天
 
+# 记忆整理重试（ALOHA 式随机退避）：定时整理撞全局 cycle 时，随机等待后重试，
+# 避免所有 chat 在同一时刻抢锁失败后都直接放弃、等到第二天。
+MEMORY_RETRY_BASE_SECONDS = 60       # 初始退避窗口（秒）
+MEMORY_RETRY_MAX_WINDOW_SECONDS = 600  # 最大退避窗口（10 分钟）
+MEMORY_RETRY_MAX_ATTEMPTS = 6        # 最多重试次数
+MEMORY_MIN_INTERVAL_SECONDS = 600    # 同一 chat 两次整理的最小间隔，防止提前触发/重试重复
+
 
 class Bot:
     """机器人主控制器。"""
@@ -133,6 +140,10 @@ class Bot:
         self._private_ctx_lock = threading.Lock()
         # 记忆整理调度器：{chat_key -> FixedTimeScheduler}（按每日固定时刻触发）
         self.memory_schedulers: dict[str, FixedTimeScheduler] = {}
+        # 记忆整理重试状态：撞全局 cycle 时随机退避后重试
+        self._memory_retry_lock = threading.Lock()
+        self._memory_retry_timers: dict[str, threading.Timer] = {}
+        self._last_memory_consolidation: dict[str, float] = {}
 
     def warmup(self):
         """启动预热。"""
@@ -408,30 +419,103 @@ class Bot:
 
         return wrote_memory
 
-    def on_memory_consolidation(self, ctx: ChatContext):
+    def on_memory_consolidation(self, ctx: ChatContext, attempt: int = 0):
         """定时记忆整理回调（每日固定时刻，由 FixedTimeScheduler 触发）。
 
         整理 cycle 不回复聊天、不消费 pending；只读取 history 并更新 core/journal。
-        撞其他 chat 的 cycle 时跳过本次，避免把正常对话拖慢。
+
+        撞其他 chat 的 cycle 时不再直接放弃，而是按 ALOHA 式随机退避重试
+        （见 _schedule_memory_retry），避免所有 chat 同时抢锁失败后都等到第二天。
         """
         try:
             if not self._memory_enabled():
+                self._cancel_memory_retry(ctx)
                 return
+            if attempt == 0:
+                # 新的定时时刻：取消之前挂起的重试，避免同一时刻重复整理
+                self._cancel_memory_retry(ctx)
             if not self._has_memory_to_consolidate(ctx):
                 logger.info(f"{ctx.chat_key} 记忆整理跳过：没有可整理的历史")
+                self._cancel_memory_retry(ctx)
                 return
+
+            # 防止提前触发/重试重复：同一 chat 短时间内不重复整理
+            now = time.time()
+            with self._memory_retry_lock:
+                last = self._last_memory_consolidation.get(ctx.chat_key, 0.0)
+            if now - last < MEMORY_MIN_INTERVAL_SECONDS:
+                logger.info(f"{ctx.chat_key} 近期已整理过（{now - last:.0f}s 前），跳过本次")
+                self._cancel_memory_retry(ctx)
+                return
+
             if not self._try_enter_cycle(ctx, register_retry=False):
-                logger.info(f"{ctx.chat_key} 记忆整理撞 cycle，跳过本次")
+                self._schedule_memory_retry(ctx, attempt)
                 return
             try:
                 # P006：整理前先把最近对话队列落盘，让整理能看到最近几轮
                 self._flush_recent_blocks(ctx)
                 self._run_memory_cycle(ctx)
+                with self._memory_retry_lock:
+                    self._last_memory_consolidation[ctx.chat_key] = time.time()
             finally:
                 self._exit_cycle(ctx)
                 self._drain_cycle_queue()
+            # 成功后清理重试状态
+            self._cancel_memory_retry(ctx)
         except Exception as e:
             logger.error(f"{ctx.chat_key} 记忆整理异常: {e}", exc_info=True)
+
+    def _schedule_memory_retry(self, ctx: ChatContext, attempt: int):
+        """撞 cycle 后按 ALOHA 式随机退避安排一次重试。
+
+        第 n 次重试的退避窗口为 base * 2^n（封顶 max_window），
+        在实际等待时间上取 [0.5*window, window] 的随机值，错开各 chat 的重试时刻。
+        """
+        if attempt >= MEMORY_RETRY_MAX_ATTEMPTS:
+            logger.warning(
+                f"{ctx.chat_key} 记忆整理连续 {attempt} 次撞 cycle，"
+                f"放弃本次（等待下一个定时时刻）"
+            )
+            self._cancel_memory_retry(ctx)
+            return
+
+        window = min(
+            MEMORY_RETRY_MAX_WINDOW_SECONDS,
+            MEMORY_RETRY_BASE_SECONDS * (2 ** attempt),
+        )
+        delay = random.uniform(0.5 * window, window)
+        next_attempt = attempt + 1
+        with self._memory_retry_lock:
+            old = self._memory_retry_timers.pop(ctx.chat_key, None)
+            if old is not None:
+                old.cancel()
+            timer = threading.Timer(
+                delay, self._on_memory_retry_timeout, args=(ctx, next_attempt)
+            )
+            timer.daemon = True
+            self._memory_retry_timers[ctx.chat_key] = timer
+            timer.start()
+        logger.info(
+            f"{ctx.chat_key} 记忆整理撞 cycle，{delay:.0f}s 后重试"
+            f"（第 {next_attempt}/{MEMORY_RETRY_MAX_ATTEMPTS} 次）"
+        )
+
+    def _on_memory_retry_timeout(self, ctx: ChatContext, attempt: int):
+        """记忆整理重试定时器到期。"""
+        try:
+            with self._memory_retry_lock:
+                self._memory_retry_timers.pop(ctx.chat_key, None)
+            logger.info(f"{ctx.chat_key} 记忆整理重试到期（第 {attempt} 次）")
+            self.on_memory_consolidation(ctx, attempt=attempt)
+        except Exception as e:
+            logger.error(f"{ctx.chat_key} 记忆整理重试异常: {e}", exc_info=True)
+
+    def _cancel_memory_retry(self, ctx: ChatContext):
+        """取消该 chat 挂起的记忆整理重试。"""
+        with self._memory_retry_lock:
+            timer = self._memory_retry_timers.pop(ctx.chat_key, None)
+        if timer is not None:
+            timer.cancel()
 
     def _run_memory_cycle(self, ctx: ChatContext):
         """执行一次记忆整理（不发送聊天消息，不写 conversation turn）。"""
