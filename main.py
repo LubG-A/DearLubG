@@ -17,6 +17,13 @@
 - 未发出的消息全部停发，存入 _unsent_intent；下一轮 user content 注入"# 被打断的发言"
 - 已发出的不撤回；连续完整打断 INTERRUPT_STREAK_LIMIT 次后强制发出一次
 
+最近对话块队列（P006）：
+- 每次触发把当前 pending 构造为一个块（消息结构），**LLM 成功后才入队**
+- 队列随 conversation.json 持久化（recent_blocks），启动时恢复，不再依赖退出 flush
+- API 请求 = system + 已落盘 history + （队列所有块 + 当前 pending）拼接（一条 user）
+- 入队后超过 recent_pack_turns 时最老块出队，落盘时才用 render_user_content 重新渲染
+- 失败/延迟回复不入队；记忆整理前 flush 进 history（一次原子 save）
+
 并发模型（B2 方案）：
 - 接收线程（webhook）只写 fast_buffer（HistoryManager 内 _buffer_lock 保护，持锁极短）
 - LLM 工作线程用 _cycle_running 标志保证串行，LLM 调用和发送不持锁
@@ -35,6 +42,7 @@ import time
 import random
 import threading
 from collections import deque
+from datetime import datetime
 from typing import Optional
 
 from src.config import load_config
@@ -363,6 +371,7 @@ class Bot:
         """是否还有值得整理的历史/记忆。"""
         return (
             ctx.history.turn_count() > 0
+            or bool(ctx.history.recent_blocks)
             or ctx.memory.has_journal()
             or bool(ctx.memory.get_core())
         )
@@ -415,6 +424,8 @@ class Bot:
                 logger.info(f"{ctx.chat_key} 记忆整理撞 cycle，跳过本次")
                 return
             try:
+                # P006：整理前先把最近对话队列落盘，让整理能看到最近几轮
+                self._flush_recent_blocks(ctx)
                 self._run_memory_cycle(ctx)
             finally:
                 self._exit_cycle(ctx)
@@ -1132,9 +1143,17 @@ class Bot:
             system_prompt = self.persona_renderer.render_system_prompt(
                 core_memory=core_memory, chat_type=ctx.chat_type
             )
+            # P006：本轮块先构造但**不入队**；请求直接拼接"队列 + 当前 pending"。
+            # 只有 LLM 成功后才入队；入队时若超过窗口，最老块才出队落盘 history。
+            intent_text = self._format_unsent_intent(ctx)
+            block = self._make_recent_block(ctx, is_active, intent_text)
+
             history_messages = ctx.history.get_messages_for_llm()
             member_list = self._build_member_list(ctx)
-            pending_text = ctx.history.build_user_content()
+
+            # 当前请求 = system + 已落盘 history +（队列所有块 + 当前 pending）的连续消息记录
+            # 复用 HistoryManager.build_user_content 的渲染逻辑，只多传一个"队列前缀"
+            pending_text = ctx.history.build_user_content(self._recent_block_entries(ctx))
             journal_block = ""
             memo_block = ""
             if self._memory_enabled():
@@ -1144,18 +1163,15 @@ class Bot:
                     else ctx.memory.render_journal_block()
                 )
                 memo_block = ctx.memory.render_memo_block()
+            last_state_text = _format_state(ctx._last_state) if ctx._last_state else ""
             render_kwargs = dict(
                 is_active=is_active, chat_type=ctx.chat_type, peer=self._private_peer(ctx),
-                interrupted_intent=self._format_unsent_intent(ctx),
+                interrupted_intent=intent_text,
                 journal=journal_block, memo=memo_block, memory_consolidation=needs_compact,
+                last_state=last_state_text,
             )
             new_user_content = self.persona_renderer.render_user_content(
                 pending_text, member_list, self.self_nickname, self.self_qq, **render_kwargs
-            )
-            # 落历史版本：剥离备忘/日记/整理指令，避免旧提示冻结在 messages 里
-            stored_user_content = self.persona_renderer.render_user_content(
-                pending_text, member_list, self.self_nickname, self.self_qq,
-                **{**render_kwargs, "for_storage": True},
             )
 
             # 5. 调用 LLM（不持锁，_cycle_running 标志保证串行）
@@ -1168,7 +1184,7 @@ class Bot:
             )
             if raw_result is None:
                 logger.warning("LLM 调用失败，本轮跳过")
-                # pending 留待下次触发再拼入（消息不丢失）
+                # 本轮块未入队，直接丢弃；pending 留待下次触发再拼入（消息不丢失）
                 if self._consume_pending_trigger(ctx):
                     continue
                 return
@@ -1188,6 +1204,7 @@ class Bot:
 
             # 延迟回复处理：LLM 觉得"等会再回"，把这批消息存到 delayed_replies
             if parsed.reply_delay_minutes > 0 and parsed.action == "silent":
+                # 本轮块未入队，直接丢弃；pending 转存 delayed
                 stashed = ctx.history.stash_pending_as_delayed(parsed.reply_delay_minutes)
                 # 私聊没有主动触发兜底，需要自己排程到期唤醒；主动触发时 pending 为空则不排程
                 if ctx.chat_type == "private" and stashed > 0:
@@ -1196,11 +1213,17 @@ class Bot:
                     continue
                 return
 
-            # 清空 pending（user_content 已在步骤 4 构建，不重新 build）
-            ctx.history.consume_pending_into_user()
-            # 内部记忆指令不写入历史（记忆由 core/journal/memo 块统一呈现）
+            # 完成本轮块：assistant/state 填入块；成功后才入队（出队时才落盘 history）
             stored_assistant = strip_internal_commands(raw_result) or raw_result
-            ctx.history.append_turn(stored_user_content, stored_assistant)
+            block["assistant"] = stored_assistant
+            block["state"] = parsed.state
+            block["finalized"] = True
+            ctx._last_state = parsed.state
+            # 成功才入队；超过窗口时最老块此时才出队落盘
+            self._append_recent_block(ctx, block)
+            ctx.history.consume_pending_into_user()
+            # 一次原子写入：messages + recent_blocks + pending/delayed 一起落盘
+            ctx.history.save()
             # 未发出的计划已注入本轮 user content，消费完毕
             ctx._unsent_intent = None
 
@@ -1392,6 +1415,88 @@ class Bot:
         lines.append("请结合你原本想表达的意思和新内容重新组织语言：原计划还合适就接着说，"
                      "不合适就改说法；没话说就 silent。")
         return "\n".join(lines)
+
+    # ---------- P006：最近对话块队列 ----------
+    def _make_recent_block(self, ctx: ChatContext, is_active: bool, intent_text: str) -> dict:
+        """用当前 pending 构造一个对话块（消息结构，不是渲染文本）。
+
+        entries 与 pending_group_msgs 同结构；images 清空（历史/队列只保留 [图片] 文本）。
+        user_content 不在这里存，落盘时用 entries 重新 render_user_content。
+        """
+        entries = [
+            {**m, "images": []}
+            for m in ctx.history.pending_group_msgs if isinstance(m, dict)
+        ]
+        return {
+            "entries": entries,
+            "assistant": "",
+            "state": {},
+            "is_active": is_active,
+            "intent": intent_text,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M %A"),
+            "finalized": False,
+        }
+
+    def _append_recent_block(self, ctx: ChatContext, block: dict):
+        """块入队（不落盘）；超过窗口时最老块出队，由调用方统一 save。"""
+        limit = max(1, int(getattr(ctx.config.trigger, "recent_pack_turns", 6)))
+        evicted = ctx.history.append_recent_block(block, limit)
+        if evicted is not None:
+            self._persist_recent_block(ctx, evicted, save=False)
+
+    def _recent_block_entries(self, ctx: ChatContext) -> list:
+        """按块顺序展开队列内的消息结构（供当前请求拼接）。"""
+        return ctx.history.get_recent_block_entries()
+
+    def _render_recent_block_user_content(self, ctx: ChatContext, block: dict) -> str:
+        """落盘时用消息结构重新渲染该块的 user 内容（不保存渲染文本）。"""
+        entries = block.get("entries") if isinstance(block, dict) else None
+        if not isinstance(entries, list):
+            entries = []
+        text = ctx.history.render_messages(entries)
+        extra_qqs = {e.get("qq") for e in entries if isinstance(e, dict) and e.get("qq")}
+        return self.persona_renderer.render_user_content(
+            text, self._build_member_list(ctx, extra_qqs=extra_qqs),
+            self.self_nickname, self.self_qq,
+            is_active=block.get("is_active", False), chat_type=ctx.chat_type,
+            peer=self._private_peer(ctx), interrupted_intent=block.get("intent", ""),
+            for_storage=True, now_str=block.get("created_at", ""),
+        )
+
+    def _persist_recent_block(self, ctx: ChatContext, block: dict, save: bool = True) -> bool:
+        """把块写入 conversation.json 的 history 序列（user/assistant 一对）。
+
+        Args:
+            save: 是否立即落盘；P006 成功路径会传 False，最后统一 save 一次
+
+        Returns:
+            True=已落盘；False=未完成/脏数据，跳过
+        """
+        if not isinstance(block, dict) or not block.get("finalized"):
+            # 未完成的块不落盘；消息仍在 pending 里
+            logger.warning(f"{ctx.chat_key} 未完成的对话块跳过落盘（保留 pending）")
+            return False
+        user_content = self._render_recent_block_user_content(ctx, block)
+        assistant = block.get("assistant")
+        if not isinstance(assistant, str):
+            assistant = "" if assistant is None else str(assistant)
+        ctx.history.append_turn(user_content, assistant, save=save)
+        entries = block.get("entries")
+        n = len(entries) if isinstance(entries, list) else 0
+        logger.info(f"{ctx.chat_key} 最近对话块落盘：{n} 条消息")
+        return True
+
+    def _flush_recent_blocks(self, ctx: ChatContext):
+        """清空某 chat 的队列并全部落盘（记忆整理前使用）。"""
+        blocks = ctx.history.take_recent_blocks()
+        persisted = 0
+        for b in blocks:
+            if self._persist_recent_block(ctx, b, save=False):
+                persisted += 1
+        if blocks:
+            logger.info(f"{ctx.chat_key} 最近对话队列清空：{persisted}/{len(blocks)} 个块已落盘")
+        # 一次原子写入：messages + queue(空) + pending/delayed
+        ctx.history.save()
 
     def _update_direct_state(self, ctx: GroupContext, parsed):
         """阶段 F：根据 LLM 输出更新 direct 状态。
@@ -1672,14 +1777,32 @@ class Bot:
             self.self_qq, self.self_nickname, msg_text, "", is_bot=True
         )
 
-    def _build_member_list(self, ctx: ChatContext) -> list:
+    def _build_member_list(self, ctx: ChatContext, extra_qqs=None) -> list:
         """构建传给 LLM 的群成员列表（含亲密度）。
 
         私聊没有群成员概念，返回空列表；user content 由 persona 渲染对方信息。
+        extra_qqs: 额外纳入"近期活跃"的 QQ（块出队落盘时带上该块自己的发言者）。
         """
         if ctx.chat_type == "private":
             return []
         recent_speakers = ctx.history.get_recent_speakers()
+        # P006：最近对话块在 history.recent_blocks 里，尚未写入 messages；把它们里的发言者也纳入近期活跃
+        blocks = ctx.history.get_recent_blocks()
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            entries = b.get("entries")
+            if not isinstance(entries, list):
+                continue
+            for e in entries:
+                if isinstance(e, dict) and e.get("qq"):
+                    recent_speakers.add(e["qq"])
+        # 当前 pending 尚未入队，其发言者也要纳入近期活跃
+        for e in ctx.history.pending_group_msgs:
+            if isinstance(e, dict) and e.get("qq"):
+                recent_speakers.add(e["qq"])
+        if extra_qqs:
+            recent_speakers.update(q for q in extra_qqs if q)
         group_members = self.napcat.member_cache.get(ctx.group_id, {})
         result = []
         for qq, info in group_members.items():
@@ -1735,9 +1858,11 @@ _STATE_ABBR = {
 
 def _format_state(state: dict) -> str:
     """把结构化内心状态压成一行日志（阶段 G，用于观测维度分布）。"""
-    if not state:
+    if not isinstance(state, dict):
         return "无"
-    dims = state.get("dims", {})
+    dims = state.get("dims")
+    if not isinstance(dims, dict):
+        dims = {}
     dim_str = " ".join(f"{abbr}={dims.get(key, 0.5)}" for key, abbr in _STATE_ABBR.items())
     mode = state.get("mode") or "无"
     return f"mode={mode} {dim_str} note={state.get('note', '')}"

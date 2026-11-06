@@ -7,6 +7,7 @@
 - 触发定时器（群聊静默窗口；私聊不使用）
 - _cycle_pending（撞 cycle 重试标志）
 - 同时发言标记 + direct 回复倒计时（P003 v2.4）
+- 最近对话块队列（P006：由 HistoryManager 随 conversation.json 持久化；本类只保存最近 state）
 
 场景差异由子类补充：
 - GroupContext：评分、归因、direct 状态、主动触发调度器
@@ -62,6 +63,15 @@ class ChatContext:
         self._interrupt_sender: str = ""
         self._unsent_intent: Optional[dict] = None
         self._interrupt_streak: int = 0
+
+        # P006：最近对话块队列已移入 HistoryManager（随 conversation.json 持久化），
+        # 这里只保存最近一次 LLM 输出的 state（用于注入"你上一轮的状态"）；
+        # 启动时从持久化队列的最后一块恢复。
+        self._last_state: dict = {}
+        if self.history.recent_blocks:
+            state = self.history.recent_blocks[-1].get("state")
+            if isinstance(state, dict):
+                self._last_state = state
 
     @property
     def chat_key(self) -> str:

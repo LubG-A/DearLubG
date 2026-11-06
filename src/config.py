@@ -43,6 +43,7 @@ class TriggerConfig:
     silent_buffer_limit: int
     history_limit: int          # 总轮数达 history_limit/2 时触发记忆整理，整理成功后才裁剪原文
     history_keep_recent: int    # 整理后保留的近期原文轮数
+    recent_pack_turns: int = 6  # P006：最近 N 轮对话块留在内存队列，打包进当前 user content
     attribution_step: float = 0.1
     cold_start_rounds: int = 20
 

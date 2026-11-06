@@ -412,7 +412,8 @@ class PersonaRenderer:
                             is_active: bool = False, chat_type: str = "group", peer: dict = None,
                             interrupted_intent: str = "",
                             journal: str = "", memo: str = "",
-                            memory_consolidation: bool = False, for_storage: bool = False) -> str:
+                            memory_consolidation: bool = False, for_storage: bool = False,
+                            last_state: str = "", now_str: str = "") -> str:
         """渲染 user 消息内容（上下文 + 记忆 + 成员/对方 + 最近消息）。
 
         群聊与私聊只在「状态文案 / 成员或对方信息 / 消息标题」三处分叉，
@@ -426,10 +427,16 @@ class PersonaRenderer:
             journal: 近期日记块（MemoryManager.render_journal_block）
             memo: 短期备忘块（MemoryManager.render_memo_block）
             memory_consolidation: 本轮是否要求模型更新长期记忆
-            for_storage: True=用于写入 conversation.json，省略记忆块与整理指令
-                         （避免历史里堆过期备忘/日记）
+            for_storage: True=用于写入 conversation.json，省略记忆块、整理指令、上一轮状态
+            last_state: P006：最近一次 LLM 输出的 state 压缩行（只给本轮，不写入历史）
+            now_str: 渲染用的时间字符串（落盘重渲染时传块创建时的时间）
         """
-        now = datetime.now().strftime("%Y-%m-%d %H:%M %A")
+        now = now_str or datetime.now().strftime("%Y-%m-%d %H:%M %A")
+        # None 安全：调用方/历史数据可能传 None
+        interrupted_intent = interrupted_intent or ""
+        journal = journal or ""
+        memo = memo or ""
+        last_state = last_state or ""
         intent_block = (
             f"# 被打断的发言\n{interrupted_intent.strip()}\n\n"
             if interrupted_intent.strip() else ""
@@ -440,6 +447,7 @@ class PersonaRenderer:
             memo_block = ""
             journal_block = ""
             consolidation_block = ""
+            last_state_block = ""
         else:
             memo_block = (
                 f"# 你的备忘录（短期提醒，只给自己看，不要复述）\n{memo.strip()}\n\n"
@@ -455,6 +463,10 @@ class PersonaRenderer:
                 f"（用；分隔，不超过 {self._memory_core_max} 字），可同时输出 journal: 新条目。"
                 "系统会在你产出记忆后裁剪更早的原文；没有产出记忆则保留原文。\n\n"
                 if memory_consolidation else ""
+            )
+            last_state_block = (
+                f"# 你上一轮的状态（只给自己看，不要复述）\n{last_state.strip()}\n\n"
+                if last_state.strip() else ""
             )
 
         # 状态行：主动检查 / 被动触发（私聊是一对一）
@@ -489,7 +501,7 @@ class PersonaRenderer:
 {status_line}
 {context_line}
 
-{memo_block}{journal_block}{consolidation_block}{intent_block}{message_title}（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
+{memo_block}{journal_block}{consolidation_block}{intent_block}{last_state_block}{message_title}（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用，bot 消息无此标记不可引用）
 {messages_section}
 
 请按行指令输出。"""

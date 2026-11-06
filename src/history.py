@@ -53,6 +53,10 @@ class HistoryManager:
         # 延迟回复缓冲：LLM 觉得"等会再回"时，把这批 pending 消息存到这里
         # 格式：[{"due_time":"ISO时间戳", "messages":[{同 pending 格式}]}]
         self.delayed_replies: list[dict] = []
+        # P006：最近对话块队列（尚未写入 messages 的最近 N 轮），随 conversation.json 持久化
+        # 每块 = {entries, assistant, state, is_active, intent, created_at, finalized}
+        self.recent_blocks: list[dict] = []
+        self._blocks_lock = threading.Lock()
         self._load()
 
     # ---------- 持久化 ----------
@@ -63,9 +67,35 @@ class HistoryManager:
                 self.messages = data.get("messages", [])
                 self.pending_group_msgs = data.get("pending_group_msgs", [])
                 self.delayed_replies = data.get("delayed_replies", [])
+                self.recent_blocks = self._sanitize_recent_blocks(data.get("recent_blocks", []))
             except Exception as e:
                 logger.warning(f"加载历史失败: {e}")
         self._migrate_legacy_messages()
+
+    @staticmethod
+    def _sanitize_recent_blocks(raw) -> list[dict]:
+        """校验并重建持久化的最近对话块，脏数据直接丢弃（避免启动时崩溃）。"""
+        if not isinstance(raw, list):
+            return []
+        result = []
+        for b in raw:
+            if not isinstance(b, dict) or not b.get("finalized"):
+                continue
+            entries = b.get("entries")
+            if not isinstance(entries, list):
+                entries = []
+            entries = [e for e in entries if isinstance(e, dict)]
+            state = b.get("state")
+            result.append({
+                "entries": entries,
+                "assistant": b.get("assistant") if isinstance(b.get("assistant"), str) else "",
+                "state": state if isinstance(state, dict) else {},
+                "is_active": bool(b.get("is_active", False)),
+                "intent": b.get("intent") if isinstance(b.get("intent"), str) else "",
+                "created_at": b.get("created_at") if isinstance(b.get("created_at"), str) else "",
+                "finalized": True,
+            })
+        return result
 
     def _migrate_legacy_messages(self):
         """P005 迁移：旧 assistant 是 JSON，会教模型继续输出 JSON。
@@ -92,17 +122,54 @@ class HistoryManager:
         logger.warning(f"检测到旧 JSON 历史，已归档到 {backup} 并清空 messages（P005 迁移）")
 
     def _save(self):
-        """原子写入：临时文件 + rename，避免压缩中途崩溃导致文件损坏。"""
+        """原子写入：临时文件 + rename，避免崩溃导致文件损坏。"""
+        with self._blocks_lock:
+            recent_blocks = list(self.recent_blocks)
         tmp = self.file.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps({
                 "messages": self.messages,
                 "pending_group_msgs": self.pending_group_msgs,
                 "delayed_replies": self.delayed_replies,
+                "recent_blocks": recent_blocks,
             }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         tmp.replace(self.file)  # 原子操作（同文件系统内）
+
+    # ---------- P006：最近对话块队列 ----------
+    def append_recent_block(self, block: dict, limit: int) -> Optional[dict]:
+        """追加块；超过 limit 时 pop 最老块并返回（不落盘，调用方负责 save）。"""
+        with self._blocks_lock:
+            self.recent_blocks.append(block)
+            if len(self.recent_blocks) > limit:
+                return self.recent_blocks.pop(0)
+            return None
+
+    def take_recent_blocks(self) -> list:
+        """取出并清空队列（不落盘，调用方负责 save）。"""
+        with self._blocks_lock:
+            blocks = list(self.recent_blocks)
+            self.recent_blocks = []
+        return blocks
+
+    def get_recent_blocks(self) -> list:
+        """只读快照（供成员列表/渲染使用）。"""
+        with self._blocks_lock:
+            return list(self.recent_blocks)
+
+    def get_recent_block_entries(self) -> list:
+        """按块顺序展开队列内的消息结构（供当前请求拼接）。"""
+        result = []
+        for b in self.get_recent_blocks():
+            entries = b.get("entries")
+            if isinstance(entries, list):
+                result.extend(e for e in entries if isinstance(e, dict))
+        return result
+
+    def save(self):
+        """显式落盘（P006 成功路径用于一次原子写入）。"""
+        self._save()
 
     # ---------- 群消息追加（入 fast_buffer，接收线程 / LLM 线程均调用） ----------
     def append_group_message(self, qq: str, nickname: str, content: str, msg_id: str,
@@ -242,28 +309,40 @@ class HistoryManager:
         return updated
 
     # ---------- 构建 user content（触发"看一眼"时调用） ----------
-    def build_user_content(self) -> str:
-        """把 pending buffer 拼成 user content。
+    def render_messages(self, entries: list) -> str:
+        """把消息结构列表渲染成 user content 里的消息行（P006 也用于最近对话块）。
 
         格式（msg_id 标记用于 reply 段引用，bot 消息无标记不可引用）：
-        # 最近群消息（按时间顺序，每行一条，[#msg_id] 标记可用于 reply 段引用）
         [#1281341473] [20:03:37] 张三(123456789): 你好啊
         [#1281341474] [20:03:43] 张三(123456789): 你好
         [20:04:00] [bot] 林夏(...): 嗯                    # bot 消息不可引用（无 [#] 前缀）
         [#1281341475] [20:04:05] 张三(123456789): 之前那条  [延迟回复]
-
-        注：连发由"批量 drain + 静默窗口"自然体现——LLM 会看到多条同一发送者
-        时间戳相邻的消息，无需额外标记。
         """
         lines = []
-        for m in self.pending_group_msgs:
-            prefix = "[bot]" if m["is_bot"] else ""
-            msg_id_tag = f"[#{m['msg_id']}]" if (not m["is_bot"] and m.get("msg_id")) else ""
+        for m in (entries or []):
+            if not isinstance(m, dict):
+                continue
+            prefix = "[bot]" if m.get("is_bot") else ""
+            msg_id = m.get("msg_id", "")
+            msg_id_tag = f"[#{msg_id}]" if (not m.get("is_bot") and msg_id) else ""
             tag = "  [延迟回复]" if m.get("is_delayed") else ""
             lines.append(
-                f"{msg_id_tag} [{m['time']}] {prefix}{m['nickname']}({m['qq']}): {m['content']}{tag}"
+                f"{msg_id_tag} [{m.get('time', '')}] {prefix}"
+                f"{m.get('nickname', '')}({m.get('qq', '')}): {m.get('content', '')}{tag}"
             )
         return "\n".join(lines)
+
+    def build_user_content(self, prefix_entries: Optional[list] = None) -> str:
+        """把"前置消息结构（最近对话块）+ 当前 pending"拼成 user content。
+
+        复用原 build_user_content 的渲染逻辑（render_messages）：
+        - prefix_entries 为空时等价于原来的"只渲染当前 pending"；
+        - P006 传入最近对话块的 entries，让队列块和当前 pending 按时间顺序拼成一段。
+        多媒体仍由 collect_pending_images 单独从当前 pending 收集。
+        """
+        entries = list(prefix_entries or [])
+        entries.extend(self.pending_group_msgs)
+        return self.render_messages(entries)
 
     def consume_pending_into_user(self):
         """清空 pending（user_content 已由调用方通过 build_user_content 预构建）。
@@ -274,7 +353,7 @@ class HistoryManager:
         self.pending_group_msgs = []
 
     # ---------- 落地一轮对话 ----------
-    def append_turn(self, user_content: str, assistant_content: str):
+    def append_turn(self, user_content: str, assistant_content: str, save: bool = True):
         """追加一轮 user/assistant 对话。
 
         只负责追加与持久化；是否裁剪由 main.py 在记忆整理成功后调用 trim_to_recent。
@@ -282,10 +361,13 @@ class HistoryManager:
         Args:
             user_content: 本轮群消息批次
             assistant_content: LLM 返回的行指令文本（内部记忆指令已剥离）
+            save: 是否立即落盘。P006 成功路径会传 False，最后统一 save() 一次，
+                  保证 queue/pending/messages 原子写入
         """
         self.messages.append({"role": "user", "content": user_content})
         self.messages.append({"role": "assistant", "content": assistant_content})
-        self._save()
+        if save:
+            self._save()
 
     def turn_count(self) -> int:
         """当前 user/assistant 对数。"""
@@ -311,28 +393,16 @@ class HistoryManager:
     def get_messages_for_llm(self) -> list[dict]:
         """返回传给 LLM 的 messages 列表（不含 system，system 由调用方拼接）。
 
-        P003 方案 A：对历史 user message 做标记转换，消除"回复触发点"：
-        - 除最后一条 user 外，user content 开头的 "# 当前上下文" → "# 历史上下文"
-        - 除最后一条 user 外，删除末尾的 "请按行指令输出。"（兼容旧历史的 "请输出 JSON。"）
-        目的：让 LLM 明确区分历史参考材料与当前请求，避免注意力漂移到历史旧话题。
-
+        P003 方案 A：对**所有**历史 user message 做标记转换，消除"回复触发点"：
+        - user content 开头的 "# 当前上下文" → "# 历史上下文"
+        - 删除末尾的 "请按行指令输出。"（兼容旧历史的 "请输出 JSON。"）
+        当前请求的 user content 由调用方单独作为最后一条 user 追加，不在 messages 里；
+        因此历史里的每一条 user 都应按"历史上下文"处理。
         转换在返回时做，不持久化到 conversation.json，不影响其他功能。
         """
-        messages = self.messages.copy()
-        if not messages:
-            return messages
-
-        # 找到最后一条 user 的索引
-        last_user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i]["role"] == "user":
-                last_user_idx = i
-                break
-
-        # 对除最后一条 user 外的所有 user content 做转换
         result = []
-        for i, m in enumerate(messages):
-            if m["role"] == "user" and i != last_user_idx:
+        for m in self.messages:
+            if m["role"] == "user":
                 content = m["content"]
                 # 替换开头标记
                 if content.startswith("# 当前上下文"):
@@ -479,6 +549,9 @@ class HistoryManager:
             "messages": list(self.pending_group_msgs),  # 拷贝
         })
         count = len(self.pending_group_msgs)
+        # 审计修复：存到 delayed 后必须清空 pending，否则下一轮会立刻重复处理同一批消息，
+        # 且到期时 delayed 又把它们加回 pending，导致重复块/重复回复。
+        self.pending_group_msgs = []
         logger.info(f"延迟回复：存入 {count} 条消息，{delay_minutes} 分钟后到期（{due.strftime('%H:%M:%S')}）")
         self._save()
         return count
