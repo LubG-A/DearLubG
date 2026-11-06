@@ -22,12 +22,6 @@ persona:
   interests: [原神, 二次元, 写代码, 深夜emo, 小夏]   # 同时作为评分触发的兴趣关键词
   catchphrases: ["不是吧", "6", "笑死", "真的会谢"]
   style: 常用省略号、偶尔不加句号、爱用单字回应、吐槽时会爆两三句连发
-  forbidden:
-    - 客服腔
-    - 感叹号堆叠
-    - 任何"作为AI/我是模型"类自我表明
-    - 列点式回答
-    - 礼貌性长篇大论
 
 voice:
   ai_record_character: "lucy-voice-f34"   # /send_group_ai_record 的 character 参数
@@ -42,8 +36,9 @@ media_download:
 trigger:
   peek_threshold: 10
   silent_buffer_limit: 30
-  history_limit: 240                  # 总轮数达 240（120 轮）时触发记忆整理，整理成功后才裁剪原文
-  history_keep_recent: 60             # 整理后保留近 60 轮原文
+  history_limit: 480                  # 总轮数达 480（240 轮）时触发记忆整理，整理成功后才裁剪原文
+  history_keep_recent: 120             # 整理后保留近 120 轮原文
+  recent_pack_turns: 6                # P006：最近 N 轮对话块留在内存队列，打包进当前 user content；满了才落盘 history
   attribution_step: 0.05
   cold_start_rounds: 20               # 冷启动保护：前 N 轮不更新 dynamic_weight，仅记日志
 
@@ -56,7 +51,7 @@ memory:
   journal_keep_hours: 72              # 整理后保留日记的时间窗（小时）
   journal_keep_max_entries: 60        # 整理后保留日记的最大条数
   core_max_chars: 1200                # 长期记忆最大字数
-  consolidate_times: ["12:00", "00:00"]  # 每日记忆整理时刻（本地时间）
+  consolidate_times: ["00:00"]  # 每日记忆整理时刻（本地时间）
   memo_enabled: true                  # 短期备忘开关
   memo_default_ttl_hours: 72          # 备忘默认过期时间（小时）
   memo_max_items: 10                  # 备忘最大条数
@@ -86,13 +81,13 @@ active_trigger:
 # 私聊配置（群聊的减法：白名单一对一，无评分/归因；可选主动触发）
 private:
   enabled: true
-  allow_list: ["3184546563"]                 # 允许私聊的 QQ 白名单，部署时填写
+  allow_list: ["1919810"]                 # 允许私聊的 QQ 白名单，部署时填写
   cooldown_seconds: 3            # 回复后的冷却（秒），冷却内到达的消息走补触发
   # 私聊主动触发：偶尔主动找白名单用户聊天（每个对象独立倒计时）
   active_trigger:
     enabled: true
-    min_interval_minutes: 120    # 主动触发最小间隔（分钟）
-    max_interval_minutes: 360    # 主动触发最大间隔（分钟）
+    min_interval_minutes: 60    # 主动触发最小间隔（分钟）
+    max_interval_minutes: 180    # 主动触发最大间隔（分钟）
     night_start_hour: 23         # 深夜起始小时（禁用主动触发）
     night_end_hour: 3            # 深夜结束小时
 

@@ -10,3 +10,6 @@ state/
 
 # 忽略pycache
 __pycache__/
+
+# 忽略配置文件
+config-backup.yaml

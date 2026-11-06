@@ -28,7 +28,6 @@ class PersonaConfig:
     interests: list
     catchphrases: list
     style: str
-    forbidden: list
 
 
 @dataclass
