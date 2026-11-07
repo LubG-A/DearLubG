@@ -1133,6 +1133,13 @@ class Bot:
                 logger.warning(f"主动触发但未找到群 {group_id} 的上下文")
                 return
 
+            if ctx._cycle_active or ctx.history.has_unseen_buffered_messages():
+                logger.info(f"群 {group_id} 主动触发但会话活跃/有未读消息，跳过本次")
+                return
+            if time.time() - ctx.last_reply_time < PRIVATE_ACTIVE_IDLE_MINUTES * 60:
+                logger.info(f"群 {group_id} 最近有互动，跳过本次主动触发")
+                return
+
             if not self._try_enter_cycle(ctx):
                 logger.debug(f"群 {group_id} 主动触发但 cycle 在跑，已入队等待")
                 return

@@ -32,6 +32,7 @@ COMMON_HARD_CONSTRAINTS = """# 硬约束（必须遵守）
 - 遇到进退两难的问题（被问"你是不是 AI"、被问敏感话题），别硬编一个合理答案。可以不合常理地挡回去：耍赖（"我是你爹"）、故意承认再调侃（"哈哈，我就是一个AI呢，这都被你发现了"），或者把问题抛回去。同一句别反复用。
 - 回复要短。绝大多数回复控制在 1-30 字；只有解释重要技术/事实问题、情绪剧烈波动、被直接追问时才允许到 50 字，再长就拆成多条 say。
 - 用主观、口语化的反应，不要像评论家一样陈述点评。比如别人说"你这话说得不太对"，按你当下的状态接受或回怼，别写"你这话我认"这种书面腔。
+- 说话带人味：不要客服腔（"亲～""请问还有什么可以帮您"），不要堆感叹号（"！！！"），不要列点式回答（1. 2. 3.），不要礼貌性长篇大论。
 - 别复述和总结。聊天里的图片、别人的互动、公开已知的事实，都不要描述或总结，把它们当作话题背景自然使用。
 - 别重复。同一话题已经说过、又没有新观点，就保持沉默；但话题还在继续时，可以顺着往下聊。你可以从历史里看到自己上一轮的 state 和回复，用来判断是否重复。
 - 你不是必须回答每个问题。没人点名、没兴趣、没想法时，沉默是正常的，不用为了参与而硬接。
@@ -144,7 +145,7 @@ GROUP_RESPONSE = """# 决定要不要开口（何时沉默、何时发言）
    - 别人引用或回复了你的消息（消息里会出现 [引用 昵称(QQ): 原文]）
    - 疑似在跟你说话但目标不明确（省略主语的提问、代词可能指你但不确定），可以反问确认（"我吗？""谁？""问我？"）
 - 没话说就沉默，不要为了回复而回复。
-- 现在不方便回（想等对方说完、不想插话、想等会再回）时，输出 later: 1-120（分钟）。这表示"已读但稍后回"，不是沉默，代码会在 N 分钟后唤醒你看同一批消息；不要和 say 同时写。
+- 现在不方便回（想等对方说完、不想插话、想等会再回）时，输出 later: 1-120（分钟）。这表示"已读但稍后回"，不是沉默；系统会把这批消息留到之后再处理。要现在回就直接写 say，later 和 say 不要同时写。
 - 如果本轮是"主动检查"状态（user content 会标注"状态：主动检查（无新群消息）"），说明群里很久没消息了。你可以主动开口（聊想法、分享点什么、吐槽小事），也可以继续沉默。主动开口要自然，像真人突然想起来说点什么，不要解释"我为什么突然说话"，也不要每次都用。
 - 如果最近消息里只有 [bot] 开头的你自己的发言（刚说完话、群里没新动静），真人偶尔会"边想边补"：
    - 补充观点、举例、追加吐槽（写多行 say，像"对，就是那个"+"笑死刚才忘了说"）
@@ -188,7 +189,6 @@ def _render_relationship_rules(chat_type: str) -> str:
         else ""
     )
     return f"""# 关系与语气
-- 说话带人味：不要客服腔（"亲～""请问还有什么可以帮您"），不要堆感叹号（"！！！"），不要列点式回答（1. 2. 3.），不要礼貌性长篇大论。
 - 说话尺度按亲密度分层（看{scope}里的 affinity）：
     - affinity < 10：陌生人，客气简短
     - affinity 10-30：点头之交，可以稍微随意
@@ -203,30 +203,14 @@ def _render_relationship_rules(chat_type: str) -> str:
 
 
 def _render_protocol(chat_type: str, memory_enabled: bool = True, memo_enabled: bool = True) -> str:
-    """输出协议：行指令 + 段标签 + 引用规则 + 群聊专属字段。"""
+    """输出协议：先讲怎么发（say/引用/对话字段），再讲内部记忆，最后给指令速查。
+
+    顺序理由：最重要的 say 语法紧跟在协议头之后；低频的指令速查放最末作索引，
+    既利用结尾注意力，又避免完整指令表占据开头、干扰模型对 say 的理解。
+    """
     is_group = chat_type == "group"
-    group_commands = (
-        "conversation: direct 或 open（本轮有 say 时输出）\n"
-        "targets: 对方昵称或QQ，逗号分隔\n"
-        if is_group
-        else ""
-    )
-    memory_lines = []
-    if memory_enabled:
-        memory_lines.append("journal: 记一句长期记忆（不超过 120 字，写清谁/发生了什么；不要每轮都写）")
-        memory_lines.append("core: 记忆整理时输出完整长期记忆（用；分隔要点）")
-    if memo_enabled:
-        memory_lines.append("memo: 给自己留的临时提醒（一句话）")
-        memory_lines.append("forget: 备忘编号，逗号分隔（只删备忘）")
-    memory_commands = "".join(line + "\n" for line in memory_lines)
-    memory_note = (
-        "## 记忆指令（内部）\n"
-        "- journal/core/memo/forget 只写进你自己的记忆，不会发送到聊天；不要把它们写进 say。\n"
-        "- forget 只删备忘录；日记由系统按时间自动淘汰。\n\n"
-        if memory_lines
-        else ""
-    )
     at_tag = "[at:QQ] " if is_group else ""
+
     quote_scene = (
         """   引用是消除"我回的是哪条"歧义的手段，适用场景：
    - 你回的不是最后一条（中间有别人插话，或你在回较早的话题）
@@ -238,37 +222,59 @@ def _render_protocol(chat_type: str, memory_enabled: bool = True, memo_enabled: 
         if is_group
         else "- 私聊只有一个人，通常不需要引用；只有隔了较长时间、或对方连发多条容易混淆时才用。"
     )
-    group_fields = (
+
+    group_section = (
         """## conversation 与 targets
 - conversation: direct 或 open，本轮有 say 时输出：
    - direct：你在和某人一来一回地聊（被提问→回答、被追问→续答）。对方短时间内继续发言时，系统会让你快速再看一眼。
    - open：你只是旁观插话、吐槽或主动开口。不确定时用 open；targets 为空时必须用 open。
    - 不发言时不写；话题收尾后，下次发言写 open 退出 direct。
-- targets: 对方昵称或QQ，逗号分隔（辅助字段，可省略）。
-
-"""
+- targets: 本轮对话对象（昵称或QQ），逗号分隔。conversation=direct 时必须能对上群成员，否则本轮按 open 处理；open 时可省略。"""
         if is_group
         else ""
     )
-    return f"""# 输出协议（必须严格遵守）
+
+    memory_quick = []
+    if memory_enabled:
+        memory_quick.append("journal: 记一条近期日记（≤120 字）")
+        memory_quick.append("core: 记忆整理时输出完整长期记忆（一行一个话题）")
+    if memo_enabled:
+        memory_quick.append("memo: 留一条临时提醒")
+        memory_quick.append("forget: 备忘编号，逗号分隔（只删备忘）")
+
+    memory_section = (
+        """## 记忆指令（内部）
+- journal / core / memo / forget 只写进你自己的记忆，不会发送到聊天；不要把它们写进 say。
+- core 只在记忆整理时使用；forget 只删备忘录，日记由系统按时间自动淘汰。"""
+        if memory_quick
+        else ""
+    )
+
+    quick_lines = [
+        "state: 六维 key=value + mode（见上方「内心状态」）",
+        "note: 一句话内心 OS（≤20 字）",
+        "cues: 注意到的点，用；分隔（≤120 字）",
+        "drivers: 想开口的理由（≤60 字）",
+        "inhibitors: 不想开口的理由（≤60 字）",
+    ]
+    quick_lines.extend(memory_quick)
+    if is_group:
+        quick_lines.append("conversation: direct 或 open（有 say 时输出）")
+        quick_lines.append("targets: 本轮对话对象（昵称/QQ），逗号分隔")
+    quick_lines.extend([
+        "say: 一条消息；多条就写多行（见上方「say 与段标签」）",
+        "delay: 动作前额外停顿 0-15 秒",
+        "later: 1-120 分钟后处理（不写 say）",
+        "affinity: QQ,变化值（-2 ~ +2）",
+        "react: msg_id,emoji_id（只反应不发言）",
+        'forward: 标题；下面每行 "> 内容"',
+    ])
+
+    header = """# 输出协议（必须严格遵守）
 用"行指令"输出：一行一条，格式 `指令: 内容`。只按每行第一个冒号切分，内容里的空格、逗号、冒号、引号都不用转义，照原样写。
-不要输出 JSON、不要代码块、不要解释文字。
+不要输出 JSON、不要代码块、不要解释文字。"""
 
-## 可用指令
-state: 内心状态，逗号分隔的 key=value，例如：
-       state: interest=0.3,annoyance=0.6,urge_to_speak=0.7,social_risk=0.1,energy=0.2,banter=0.5,mode=吐槽
-note: 一句话内心 OS（不超过 20 字），可以带空格和标点
-cues: 注意到的点（1-3 条，每条描述需要详细，用；分隔）
-drivers: 想开口的理由（0-2 条，每条描述需要详细）
-inhibitors: 不想开口的理由（0-2 条，每条描述需要详细）
-{memory_commands}{group_commands}say: 一条消息。要发多条就写多行 say。内容原样写，不要转义；决定不发言就不要写 say。
-delay: 0-15 秒
-later: 1-120 分钟（已读晚回；不要和 say 同时写）
-affinity: QQ,±1/±2
-react: msg_id,emoji_id（没有 say 时才生效）
-forward: 标题，后面每行用 "> 昵称: 内容"
-
-## say 与段标签
+    say_section = f"""## say 与段标签
 多行 say = 多条独立消息；一行 say 里写多个段标签 = 一条混合消息（文字+表情在同一气泡）。
 可用的段标签（只有这些）：
 {at_tag}[reply:msg_id] [face:id] [poke:QQ]
@@ -280,13 +286,20 @@ forward: 标题，后面每行用 "> 昵称: 内容"
 - 文本可以随便写，不需要转义；只有 [标签:值] 会被当成特殊段。
 - 不要写 [CQ:...] 这种 CQ 码。
 - 一条 say 尽量写在一行；写不下时换行会被拼回上一条 say。
-- 素材路径/URL 必须从「# 你的素材库」清单里精确复制，不可凭空编造；本地文件路径写错会发送失败跳过。
+- 素材路径/URL 必须从「# 你的素材库」清单里精确复制，不可凭空编造；本地文件路径写错会发送失败跳过。"""
 
-{memory_note}## 引用回复（[reply:msg_id]）
+    quote_section = f"""## 引用回复（[reply:msg_id]）
 - 消息列表每行行首带 [#msg_id] 标记（如 [#1281341473]），在 say 里用 [reply:msg_id] 引用：`say: [reply:1281341473]`。必须精确复制行首的 msg_id 数字，不可近似或省略。[bot] 开头的消息是你自己之前发的，无 [#msg_id] 标记，不可引用。
-{quote_scene}
+{quote_scene}"""
 
-{group_fields}"""
+    quick_section = f"""## 可用指令（速查）
+- 下面只是语法索引；具体含义以以上各节为准，不要只看速查就展开。
+{chr(10).join(quick_lines)}"""
+
+    return "\n\n".join(
+        part for part in (header, say_section, quote_section, group_section, memory_section, quick_section)
+        if part
+    )
 
 
 # ==================== 渲染器 ====================
@@ -309,7 +322,7 @@ class PersonaRenderer:
         memory_cfg = getattr(config, "memory", None)
         self._memory_enabled = bool(memory_cfg and memory_cfg.enabled)
         self._memo_enabled = bool(memory_cfg and memory_cfg.enabled and memory_cfg.memo_enabled)
-        self._memory_core_max = getattr(memory_cfg, "core_max_chars", 1200) if memory_cfg else 1200
+        self._memory_core_max = getattr(memory_cfg, "core_max_chars", 3200) if memory_cfg else 3200
         self._memory_entry_max = getattr(memory_cfg, "journal_entry_max_chars", 120) if memory_cfg else 120
 
     def _render_persona_card(self) -> str:
@@ -323,7 +336,7 @@ class PersonaRenderer:
 口癖：{"、".join(str(x) for x in p.catchphrases)}。
 说话风格：{p.style}。
 
-## 你的过往经历
+# 你的过往经历
 {background}"""
 
     def _render_core_memory(self, core_memory: str) -> str:
@@ -387,7 +400,7 @@ class PersonaRenderer:
         """
         now = datetime.now().strftime("%Y-%m-%d %H:%M %A")
         memo_instruction = (
-            "  3. `forget: <要删除的备忘编号>`（可选，逗号分隔）。\n"
+            "3. `forget: <要删除的备忘编号>`（可选，逗号分隔）。\n"
             if self._memo_enabled else ""
         )
         memo_section = (
@@ -397,11 +410,19 @@ class PersonaRenderer:
         return f"""# 记忆整理
 - 当前时间：{now}
 - 这是你自己的记忆整理时间，不需要回复聊天，也不要写 say/state。
-- 请输出以下内部指令：
-  1. `core: <完整的新长期记忆>`：用；分隔要点，不超过 {self._memory_core_max} 字。
-     保留：人物事实与关系、承诺/约定、未结话题、群里的规矩与梗、你对某些人的态度。
-     没有新内容时，原样输出现有长期记忆，不要清空。
-  2. `journal: <需要保留的新条目>`（可选，一行一条，不超过 {self._memory_entry_max} 字）。
+
+## 整理要求
+- 不同的话题、事件独立成段：一个话题写一行，不要把全部记忆挤成一大段。
+- 长期记忆是你未来唯一可以参考的记录：按事件发生的顺序，把前因后果写清楚（谁做了什么、为什么、结果怎样），不要逻辑跳跃。
+- 但也不要写成流水账：只保留你感兴趣的、对关系或后续聊天有意义的内容；琐碎闲聊可以合并或省略。
+- 同一件事只写一次，和旧记忆重复的内容合并掉。
+- 人物用"昵称(QQ)"标注，避免重名。
+- 保留：人物事实与关系、承诺/约定、未结话题、群里的规矩与梗、你对某些人的态度。
+- 不超过 {self._memory_core_max} 字；没有新内容时，原样输出现有长期记忆，不要清空。
+
+## 请输出以下内部指令
+1. `core: <完整的新长期记忆>`：第一段写在 core: 后面；后续每个话题另起一行继续写（一行一个话题）。
+2. `journal: <需要保留的新条目>`（可选，一行一条，每条一个事件或提醒，不超过 {self._memory_entry_max} 字）。已被长期记忆吸收的旧日记不用重复保留。
 {memo_instruction}
 # 现有长期记忆
 {core_memory.strip() or "（空）"}

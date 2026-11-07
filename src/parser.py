@@ -16,6 +16,8 @@ COMMANDS = ("state", "note", "cues", "drivers", "inhibitors", "journal", "core",
             "conversation", "targets", "delay", "later", "affinity", "react", "say", "forward")
 # 可续行的自由文本指令
 FREE_TEXT_CMDS = ("note", "cues", "drivers", "inhibitors")
+# 可续行的指令：say 续写拼回上一条；core 续写拼成下一行（一行一个话题）
+CONTINUABLE_CMDS = ("say", "note", "cues", "drivers", "inhibitors", "core")
 # 内部记忆指令：只写记忆，不发送到聊天；落历史时会被剥离，避免历史里堆内部指令
 INTERNAL_COMMANDS = ("journal", "core", "memo", "forget")
 # 单条指令的保守上限（真实上限由 MemoryManager 按配置截断，这里防止异常超长载荷）
@@ -97,7 +99,11 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
 
         parsed = _split_command(line)
         if parsed is None:
-            if _looks_like_command(line):
+            if last_free == "core" and result.core_update:
+                # core 多行续写优先：话题行可能自带英文冒号（如 "AI: ..."），
+                # 不能当未知指令丢掉；保留换行，供记忆整理按"一行一个话题"存储
+                result.core_update = (result.core_update + "\n" + line).strip()
+            elif _looks_like_command(line):
                 logger.warning(f"未知指令，跳过: {line[:40]}")
                 last_free = None
             elif last_free == "say" and messages:
@@ -113,7 +119,7 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
             continue
 
         cmd, payload = parsed
-        last_free = cmd if cmd in ("say", "note", "cues", "drivers", "inhibitors") else None
+        last_free = cmd if cmd in CONTINUABLE_CMDS else None
 
         if cmd == "state":
             keep = {k: result.state[k] for k in FREE_TEXT_CMDS if k in result.state}
@@ -177,6 +183,8 @@ def parse_and_validate(raw_content: str) -> ParsedResult:
     # note/cues 等先于 state 时，state 行会补齐 dims；这里兜底"只有自由文本"的情况
     if result.state and "dims" not in result.state:
         result.state["dims"] = {d: 0.5 for d in STATE_DIMS}
+    if result.core_update:
+        result.core_update = result.core_update[:CORE_PAYLOAD_MAX]
 
     # action 由内容派生（模型不再输出 action）
     if messages:
@@ -315,9 +323,24 @@ def strip_internal_commands(raw_content: str) -> str:
 
     记忆由专门的 core/journal/memo 块呈现；如果把这些指令原样留进历史，
     既会重复占用 token，也会让模型看到一串陈旧的备忘。
+    内部指令的续行（如 core 的多行话题）也一并剥离，直到遇见下一条指令。
     state/note/cues/drivers/inhibitors 等内心状态仍然保留，用于人格连续性。
     """
     if not isinstance(raw_content, str):
         return ""
-    lines = [line for line in raw_content.splitlines() if not _INTERNAL_LINE_RE.match(line)]
+    lines = []
+    skipping = False
+    for line in raw_content.splitlines():
+        if _INTERNAL_LINE_RE.match(line):
+            skipping = True
+            continue
+        if skipping:
+            parsed = _split_command(line.strip())
+            if parsed is None:
+                # 不是新指令，视为内部指令的续行，跳过
+                continue
+            skipping = False
+            if parsed[0] in INTERNAL_COMMANDS:
+                continue
+        lines.append(line)
     return "\n".join(lines).strip()

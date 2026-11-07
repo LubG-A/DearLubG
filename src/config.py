@@ -61,7 +61,7 @@ class MemoryConfig:
     journal_entry_max_chars: int = 120      # 单条日记最大字数
     journal_keep_hours: int = 72            # 整理后保留日记的时间窗
     journal_keep_max_entries: int = 60      # 整理后保留日记的最大条数
-    core_max_chars: int = 1200              # 长期记忆最大字数
+    core_max_chars: int = 3200              # 长期记忆最大字数
     consolidate_times: list = field(default_factory=lambda: ["12:00", "00:00"])  # 每日记忆整理时刻
     memo_enabled: bool = True               # 短期备忘开关
     memo_default_ttl_hours: int = 72        # 备忘默认过期时间（小时）
@@ -183,7 +183,7 @@ def load_config(path: str = "config.yaml") -> Config:
         journal_entry_max_chars=memory_raw.get("journal_entry_max_chars", 120),
         journal_keep_hours=memory_raw.get("journal_keep_hours", 72),
         journal_keep_max_entries=memory_raw.get("journal_keep_max_entries", 60),
-        core_max_chars=memory_raw.get("core_max_chars", 1200),
+        core_max_chars=memory_raw.get("core_max_chars", 3200),
         consolidate_times=memory_raw.get("consolidate_times", ["12:00", "00:00"]),
         memo_enabled=memory_raw.get("memo_enabled", True),
         memo_default_ttl_hours=memory_raw.get("memo_default_ttl_hours", 72),

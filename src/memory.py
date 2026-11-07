@@ -146,10 +146,11 @@ class MemoryManager:
         """
         if not self.enabled:
             return False
-        text = " ".join(str(text).split()).strip()
-        if not text:
+        # 保留换行：记忆整理要求"一行一个话题/事件"，压缩成单行会丢掉分段
+        lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+        if not lines:
             return False
-        text = text[: self.cfg.core_max_chars]
+        text = "\n".join(lines)[: self.cfg.core_max_chars].rstrip()
         changed = text != self._core
         self._core = text
         if changed:
