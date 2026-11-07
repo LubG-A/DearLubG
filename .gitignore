@@ -8,8 +8,11 @@ OpenAPI.md
 media/
 state/
 
-# 忽略pycache
+# 忽略 pycache
 __pycache__/
+
+# 忽略测试输出
+tools/output/
 
 # 忽略配置文件
 config-backup.yaml
